@@ -52,7 +52,14 @@ http://localhost:3000/runs
 
 ```bash
 OPENROUTER_API_KEY=your_openrouter_api_key
-OPENROUTER_MODEL=openai/gpt-4o-mini
+OPENROUTER_MODEL=google/gemini-2.5-flash
+OPENROUTER_MAX_TOKENS=32768
+AUTO_RUN_GENERATED_APP=true
+VALIDATE_GENERATED_EXECUTION=true
+ALLOW_GENERATED_DOCKER=true
+GENERATED_COMPOSE_ENGINE=auto
+GENERATED_BACKEND_PORT=8000
+GENERATED_FRONTEND_PORT=3001
 DASHBOARD_BASE_URL=https://aitechcontest.kms-technology.com/api
 DASHBOARD_COMPANY_ID=
 DASHBOARD_COMPANY_NAME=Agentic Sprint Builder
@@ -95,7 +102,7 @@ Example metadata:
 agent_id: ba
 name: Alice BA
 role: analyst
-model: openai/gpt-4o-mini
+model: google/gemini-2.5-flash
 temperature: 0.2
 ---
 ```
@@ -125,6 +132,8 @@ app/runs/[runId]/page.tsx        # Per-run output UI
 5. Check dashboard for events if `ENABLE_DASHBOARD=true` and `DASHBOARD_COMPANY_ID` is set.
 6. Run artifacts are written under `generated-runs/{yyyy-MM-dd-HH-mm-ss}`.
 7. DEV-generated source files are written to the fixed `generated-code/` workspace.
+8. If `VALIDATE_GENERATED_EXECUTION` is not `false`, the generated project is copied into an ignored validation workspace, then set up, built, tested, and health-checked before the final QA review. Compose validation tries `docker compose` first, then Rancher/containerd `nerdctl compose`; set `GENERATED_COMPOSE_ENGINE=docker` or `GENERATED_COMPOSE_ENGINE=nerdctl` to force one.
+9. If `AUTO_RUN_GENERATED_APP` is not `false`, the generated FastAPI backend and Next.js frontend are installed and started locally after the final files are written. Defaults are backend `http://127.0.0.1:8000` and frontend `http://127.0.0.1:3001`.
 
 On each run, the agents read the current `generated-code/` snapshot plus recent `generated-runs/` history so feature changes can be handled incrementally instead of recreating the project from scratch.
 

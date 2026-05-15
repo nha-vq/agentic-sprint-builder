@@ -48,9 +48,12 @@ export function formatRunHistoryContext(runs: RunResult[]) {
         `Topic: ${run.topic}`,
         `QA status: ${run.qaStatus || 'Not recorded'}`,
         `Build readiness fix iterations: ${run.buildReadinessFixIterations ?? 0}`,
+        `Execution validation status: ${run.executionValidation?.status || 'Not recorded'}`,
+        `Execution validation fix iterations: ${run.executionValidationFixIterations ?? 0}`,
         `QA fix iterations: ${run.qaFixIterations ?? 0}`,
         `Generated files: ${files}`,
         `QA findings: ${truncate(findings, MAX_HISTORY_SECTION_CHARS)}`,
+        `Execution findings: ${truncate(run.executionValidation?.findings?.join('; ') || 'No execution findings recorded.', MAX_HISTORY_SECTION_CHARS)}`,
         `BA excerpt:\n${truncate(run.baOutput || '', MAX_HISTORY_SECTION_CHARS)}`,
         `QA report excerpt:\n${truncate(run.qaOutput || '', MAX_HISTORY_SECTION_CHARS)}`,
         `Setup excerpt:\n${truncate(run.devOutput?.setupInstructions || '', MAX_HISTORY_SECTION_CHARS)}`

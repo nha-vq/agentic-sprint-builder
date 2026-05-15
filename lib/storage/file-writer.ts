@@ -72,7 +72,19 @@ async function collectFiles(dir: string, baseDir = dir): Promise<GeneratedFile[]
 
   const files: GeneratedFile[] = [];
   for (const entry of entries) {
-    if (entry.name === 'node_modules' || entry.name === '.next' || entry.name === '.git') continue;
+    if (
+      entry.name === 'node_modules' ||
+      entry.name === '.next' ||
+      entry.name === '.git' ||
+      entry.name === '.venv' ||
+      entry.name === '.runtime-logs' ||
+      entry.name === '.validation-logs' ||
+      entry.name === '.env' ||
+      entry.name === '__pycache__' ||
+      entry.name === '.pytest_cache'
+    ) {
+      continue;
+    }
 
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {

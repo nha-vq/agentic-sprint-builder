@@ -3,8 +3,11 @@ import type { NextRequest } from 'next/server';
 
 const WINDOW_MS = readPositiveIntEnv('RUN_RATE_LIMIT_WINDOW_MS', 10 * 60 * 1000);
 const MAX_REQUESTS = readPositiveIntEnv('RUN_RATE_LIMIT_MAX', 10);
+const STATUS_WINDOW_MS = readPositiveIntEnv('RUN_STATUS_RATE_LIMIT_WINDOW_MS', 60 * 1000);
+const STATUS_MAX_REQUESTS = readPositiveIntEnv('RUN_STATUS_RATE_LIMIT_MAX', 300);
 
 const buckets = new Map<string, { count: number; resetAt: number }>();
+const statusBuckets = new Map<string, { count: number; resetAt: number }>();
 
 export class ApiGuardError extends Error {
   constructor(
@@ -45,19 +48,26 @@ function getClientKey(request: NextRequest) {
   return forwarded || request.headers.get('x-real-ip') || 'local';
 }
 
-function enforceRateLimit(request: NextRequest) {
+function enforceRateLimit(request: NextRequest, options?: { status?: boolean }) {
   const now = Date.now();
   const key = getClientKey(request);
-  const current = buckets.get(key);
+  const bucket = options?.status ? statusBuckets : buckets;
+  const maxRequests = options?.status ? STATUS_MAX_REQUESTS : MAX_REQUESTS;
+  const windowMs = options?.status ? STATUS_WINDOW_MS : WINDOW_MS;
+  const current = bucket.get(key);
 
   if (!current || current.resetAt <= now) {
-    buckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
+    bucket.set(key, { count: 1, resetAt: now + windowMs });
     return;
   }
 
   current.count += 1;
-  if (current.count > MAX_REQUESTS) {
-    throw new ApiGuardError('Too many run requests. Please wait before trying again.', 429, 'RATE_LIMITED');
+  if (current.count > maxRequests) {
+    throw new ApiGuardError(
+      options?.status ? 'Too many run status requests. Please slow polling down.' : 'Too many run requests. Please wait before trying again.',
+      429,
+      'RATE_LIMITED'
+    );
   }
 }
 
@@ -84,5 +94,10 @@ function enforceProductionAccess(request: NextRequest) {
 
 export function assertRunApiAccess(request: NextRequest) {
   enforceRateLimit(request);
+  enforceProductionAccess(request);
+}
+
+export function assertRunStatusApiAccess(request: NextRequest) {
+  enforceRateLimit(request, { status: true });
   enforceProductionAccess(request);
 }

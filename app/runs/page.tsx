@@ -47,6 +47,13 @@ export default async function RunsPage() {
                     <p>Files changed: {run.devOutput.files.length}</p>
                     <p>QA status: {run.qaStatus || 'Not recorded'}</p>
                     <p>Readiness fixes: {run.buildReadinessFixIterations ?? 0}</p>
+                    <p>Execution validation: {run.executionValidation?.status || 'Not recorded'}</p>
+                    <p>
+                      Runtime:{' '}
+                      {run.runtime
+                        ? run.runtime.services.map((service) => `${service.name} ${service.status}`).join(', ')
+                        : 'Not recorded'}
+                    </p>
                     <p>Generated code: {run.codeOutputDir || 'generated-code'}</p>
                   </div>
                 </div>

@@ -22,8 +22,11 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
               <p className="mt-2 text-sm font-semibold text-slate-700">QA Status: {result.qaStatus || 'Not recorded'}</p>
               <p className="mt-1 text-sm text-slate-500">Build readiness fix iterations: {result.buildReadinessFixIterations ?? 0}</p>
               <p className="mt-1 text-sm text-slate-500">QA fix iterations: {result.qaFixIterations ?? 0}</p>
+              <p className="mt-1 text-sm text-slate-500">Execution validation fixes: {result.executionValidationFixIterations ?? 0}</p>
               <p className="mt-2 text-sm text-slate-500">Artifacts: {result.outputDir}</p>
               <p className="mt-1 text-sm text-slate-500">Generated code: {result.codeOutputDir}</p>
+              <ExecutionValidationStatus result={result} />
+              <RuntimeStatus result={result} />
             </div>
             <div className="flex flex-wrap gap-3">
               <Link href="/runs" className="rounded-2xl border border-slate-200 px-5 py-3 font-semibold hover:bg-slate-50">
@@ -56,9 +59,54 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
           content={result.devOutput.files.map((file) => `### ${file.path}\n\n\`\`\`\n${file.content}\n\`\`\``).join('\n\n')}
         />
         <Artifact title="Setup Instructions" content={result.devOutput.setupInstructions} />
+        {result.executionValidation && (
+          <Artifact title="Execution Validation" content={JSON.stringify(result.executionValidation, null, 2)} />
+        )}
         <Artifact title="QA Report" content={result.qaOutput} />
       </div>
     </main>
+  );
+}
+
+function ExecutionValidationStatus({ result }: { result: Awaited<ReturnType<typeof readRunResult>> }) {
+  if (!result?.executionValidation) return null;
+
+  return (
+    <div className="mt-4 rounded-2xl border border-slate-200 p-4">
+      <p className="text-sm font-bold uppercase text-blue-600">Execution validation - {result.executionValidation.status}</p>
+      <p className="mt-2 text-sm text-slate-700">Workspace: {result.executionValidation.workspace}</p>
+      {result.executionValidation.findings.length > 0 && (
+        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-red-700">
+          {result.executionValidation.findings.slice(0, 5).map((finding) => (
+            <li key={finding}>{finding}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RuntimeStatus({ result }: { result: Awaited<ReturnType<typeof readRunResult>> }) {
+  if (!result?.runtime) return null;
+
+  return (
+    <div className="mt-4 grid gap-3 md:grid-cols-2">
+      {result.runtime.services.map((service) => (
+        <div key={service.name} className="rounded-2xl border border-slate-200 p-4">
+          <p className="text-sm font-bold uppercase text-blue-600">
+            {service.name} runtime - {service.status}
+          </p>
+          <p className="mt-2 text-sm text-slate-700">{service.message}</p>
+          {service.url && (
+            <a href={service.url} target="_blank" rel="noreferrer" className="mt-2 block text-sm font-semibold text-blue-700 hover:text-blue-800">
+              {service.url}
+            </a>
+          )}
+          {service.pid && <p className="mt-2 text-xs text-slate-500">PID: {service.pid}</p>}
+          {service.logFile && <p className="mt-1 break-all text-xs text-slate-500">Log: {service.logFile}</p>}
+        </div>
+      ))}
+    </div>
   );
 }
 
