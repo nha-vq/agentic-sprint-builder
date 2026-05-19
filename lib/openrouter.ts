@@ -4,6 +4,7 @@ interface OpenRouterInput {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  signal?: AbortSignal;
   jsonSchema?: {
     name: string;
     schema: Record<string, unknown>;
@@ -40,8 +41,8 @@ interface OpenRouterResponse {
   }>;
 }
 
-const DEFAULT_MODEL = 'google/gemini-2.5-flash';
-const DEFAULT_MAX_TOKENS = 32_768;
+const DEFAULT_MODEL = 'google/gemini-2.5-pro';
+const DEFAULT_MAX_TOKENS = 65_536;
 
 function readPositiveIntEnv(name: string, fallback: number) {
   const raw = process.env[name];
@@ -52,8 +53,8 @@ function readPositiveIntEnv(name: string, fallback: number) {
 }
 
 export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
+  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+  if (!apiKey || /^(your_openrouter_api_key|placeholder|changeme)$/i.test(apiKey)) {
     throw new Error('Missing OPENROUTER_API_KEY. Add it to .env.local.');
   }
 
@@ -70,17 +71,21 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
   };
 
   if (input.jsonSchema) {
-    requestBody.response_format = {
-      type: 'json_schema',
-      json_schema: {
-        name: input.jsonSchema.name,
-        strict: true,
-        schema: input.jsonSchema.schema
-      }
-    };
-    requestBody.provider = {
-      require_parameters: true
-    };
+    const isAnthropicModel = model.startsWith('anthropic/');
+    if (!isAnthropicModel) {
+      requestBody.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: input.jsonSchema.name,
+          strict: true,
+          schema: input.jsonSchema.schema
+        }
+      };
+      requestBody.provider = {
+        require_parameters: true
+      };
+    }
+    // Anthropic models handle JSON via system prompt; no json_schema param needed
   }
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -91,11 +96,16 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
       'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:3000',
       'X-Title': process.env.OPENROUTER_APP_NAME || 'Agentic Sprint Builder'
     },
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(requestBody),
+    signal: input.signal
   });
 
   if (!response.ok) {
     const errorText = await response.text();
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`OpenRouter authentication failed (${response.status}). Check OPENROUTER_API_KEY in .env.local or .env. Provider response: ${errorText}`);
+    }
+
     throw new Error(`OpenRouter error ${response.status}: ${errorText}`);
   }
 

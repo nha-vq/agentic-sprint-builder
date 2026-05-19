@@ -1,4 +1,4 @@
-export type AgentId = 'ba' | 'dev' | 'qa';
+export type AgentId = 'ba' | 'tech-stack' | 'dev' | 'code-review' | 'deploy' | 'qa';
 
 export type DashboardEventType =
   | 'THINKING'
@@ -25,9 +25,10 @@ export interface RunRequest {
   techSpec?: string | null;
   apiSpec?: string;
   topic?: string;
+  projectId?: string;
 }
 
-export type RunJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type RunJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELED';
 export type RunProgressStepStatus = 'PENDING' | 'RUNNING' | 'PASS' | 'FAIL' | 'SKIPPED';
 export type RunProgressLogLevel = 'info' | 'success' | 'warn' | 'error';
 
@@ -75,6 +76,36 @@ export interface DevOutput {
   architecture: string;
   files: GeneratedFile[];
   setupInstructions: string;
+}
+
+export interface PreparedTechStackOutput {
+  frontendFramework: string;
+  backendFramework: string;
+  database: string;
+  ormMigrationTool: string;
+  packageManager: string;
+  runtimeVersions: Array<{
+    name: string;
+    version: string;
+    notes?: string;
+  }>;
+  dockerStrategy: string;
+  servicePorts: Array<{
+    service: string;
+    hostPort: number;
+    containerPort: number;
+    protocol: string;
+  }>;
+  environmentVariables: Array<{
+    name: string;
+    service: string;
+    purpose: string;
+    example: string;
+    required: boolean;
+  }>;
+  projectArchitecture: string;
+  assumptions: string[];
+  tradeoffs: string[];
 }
 
 export type RepairScopeKind = 'initial' | 'docker' | 'frontend' | 'backend' | 'database' | 'tests' | 'docs' | 'config' | 'unknown';
@@ -142,8 +173,15 @@ export interface RunResult {
   runId: string;
   createdAt: string;
   topic: string;
+  projectId?: string;
+  projectDevSkillPath?: string;
+  preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   devOutput: DevOutput;
+  codeReviewStatus?: 'PASS' | 'NEEDS_FIX';
+  codeReviewSummary?: string;
+  deployValidationStatus?: 'PASS' | 'NEEDS_FIX';
+  deployValidationSummary?: string;
   qaOutput: string;
   qaStatus?: QAStatus;
   qaFindings?: string[];

@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck"
+    "test": "npm run typecheck && node scripts/validate-first-dev-skill.mjs && node scripts/validate-project-skill-lifecycle.mjs"
   },
   "dependencies": {
     "@types/node": "^20.12.12",

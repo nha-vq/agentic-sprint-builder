@@ -4,4 +4,8 @@ node_modules
 .env.local
 generated-runs/*
 generated-code/*
+project-skills/*
 !generated-runs/.gitkeep
+!project-skills/.gitkeep
+.runtime-logs
+.env

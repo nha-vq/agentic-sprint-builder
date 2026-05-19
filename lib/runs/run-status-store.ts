@@ -4,20 +4,25 @@ const MAX_LOGS = 500;
 
 const DEFAULT_STEPS: RunProgressStep[] = [
   { id: 'ba', label: 'BA analysis', status: 'PENDING' },
+  { id: 'tech-stack', label: 'Tech stack prep', status: 'PENDING' },
   { id: 'dev', label: 'DEV generation', status: 'PENDING' },
+  { id: 'code-review', label: 'Code review', status: 'PENDING' },
+  { id: 'deploy-validation', label: 'Deploy validation', status: 'PENDING' },
   { id: 'static-validation', label: 'Static readiness', status: 'PENDING' },
-  { id: 'execution-validation', label: 'Build/run/test validation', status: 'PENDING' },
+  { id: 'execution-validation', label: 'Deploy smoke validation', status: 'PENDING' },
   { id: 'qa', label: 'QA review', status: 'PENDING' },
-  { id: 'runtime', label: 'Local runtime', status: 'PENDING' },
   { id: 'complete', label: 'Done', status: 'PENDING' }
 ];
 
 const globalForRuns = globalThis as typeof globalThis & {
   __agenticSprintRuns?: Map<string, RunStatusSnapshot>;
+  __agenticSprintRunControllers?: Map<string, AbortController>;
 };
 
 const runs = globalForRuns.__agenticSprintRuns ?? new Map<string, RunStatusSnapshot>();
 globalForRuns.__agenticSprintRuns = runs;
+const controllers = globalForRuns.__agenticSprintRunControllers ?? new Map<string, AbortController>();
+globalForRuns.__agenticSprintRunControllers = controllers;
 
 function now() {
   return new Date().toISOString();
@@ -75,6 +80,7 @@ export function createRunStatus(runId: string, topic: string) {
 export function updateRunProgress(runId: string, update: RunProgressUpdate) {
   const snapshot = runs.get(runId);
   if (!snapshot) return null;
+  if (snapshot.status === 'CANCELED') return snapshot;
 
   snapshot.status = snapshot.status === 'QUEUED' ? 'RUNNING' : snapshot.status;
   snapshot.updatedAt = now();
@@ -91,8 +97,8 @@ export function updateRunProgress(runId: string, update: RunProgressUpdate) {
 
 export function completeRunStatus(runId: string, result: RunResult) {
   const snapshot = runs.get(runId) ?? createRunStatus(runId, result.topic);
-  const hasRuntimeFailures = result.runtime?.services.some((service) => service.status === 'FAILED') ?? false;
-  const hasBlockingIssues = result.executionValidation?.status === 'NEEDS_FIX' || result.qaStatus === 'NEEDS_FIX' || hasRuntimeFailures;
+  if (snapshot.status === 'CANCELED') return snapshot;
+  const hasBlockingIssues = result.executionValidation?.status === 'NEEDS_FIX' || result.qaStatus === 'NEEDS_FIX';
 
   snapshot.status = 'COMPLETED';
   snapshot.updatedAt = now();
@@ -111,6 +117,7 @@ export function completeRunStatus(runId: string, result: RunResult) {
 export function failRunStatus(runId: string, error: unknown) {
   const snapshot = runs.get(runId);
   if (!snapshot) return null;
+  if (snapshot.status === 'CANCELED') return snapshot;
 
   const message = error instanceof Error ? error.message : String(error);
   snapshot.status = 'FAILED';
@@ -129,6 +136,41 @@ export function failRunStatus(runId: string, error: unknown) {
   });
 
   return snapshot;
+}
+
+export function registerRunController(runId: string, controller: AbortController) {
+  controllers.set(runId, controller);
+}
+
+export function clearRunController(runId: string) {
+  controllers.delete(runId);
+}
+
+export function cancelRunStatus(runId: string) {
+  const snapshot = runs.get(runId);
+  if (!snapshot) return null;
+
+  controllers.get(runId)?.abort('Run canceled by user.');
+  controllers.delete(runId);
+
+  snapshot.status = 'CANCELED';
+  snapshot.updatedAt = now();
+  if (snapshot.currentStepId) {
+    ensureStep(snapshot, snapshot.currentStepId).status = 'SKIPPED';
+  }
+  ensureStep(snapshot, 'complete').status = 'SKIPPED';
+  appendLog(snapshot, {
+    stepId: snapshot.currentStepId || 'complete',
+    stepStatus: 'SKIPPED',
+    level: 'warn',
+    message: 'Run canceled by user.'
+  });
+
+  return snapshot;
+}
+
+export function isRunCanceled(runId: string) {
+  return runs.get(runId)?.status === 'CANCELED' || controllers.get(runId)?.signal.aborted === true;
 }
 
 export function getRunStatus(runId: string) {

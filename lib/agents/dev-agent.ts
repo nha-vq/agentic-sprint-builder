@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import { runMarkdownSkillAgent } from './base-agent';
-import { formatGeneratedCodeContext, formatRunHistoryContext } from '@/lib/context/agent-context';
+import { formatGeneratedCodeContext, formatGeneratedProjectOverview, formatRunHistoryContext } from '@/lib/context/agent-context';
 import { RUN_LIMITS } from '@/lib/config/limits';
 import { extractJsonObject } from '@/lib/utils/json';
 import { formatRepairScope } from '@/lib/validation/repair-scope';
-import type { DevOutput, GeneratedFile, RepairScope, RunProgressReporter, RunResult } from '@/lib/types';
+import type { ProjectDevSkill } from '@/lib/skills/project-dev-skill';
+import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RepairScope, RunProgressReporter, RunResult } from '@/lib/types';
 
 const GeneratedFileSchema = z.object({
   path: z.string().min(1).max(240),
@@ -61,6 +62,16 @@ const DevManifestSchema = z.object({
 
 type DevManifest = z.infer<typeof DevManifestSchema>;
 
+class OversizedGeneratedFileError extends Error {
+  constructor(
+    public readonly filePath: string,
+    public readonly bytes: number,
+    public readonly limit: number
+  ) {
+    super(`Generated file ${filePath} is ${bytes} bytes, exceeding ${limit} bytes.`);
+  }
+}
+
 const DevManifestJsonSchema = {
   type: 'object',
   additionalProperties: false,
@@ -89,7 +100,7 @@ const GeneratedFileJsonSchema = {
   required: ['path', 'content'],
   properties: {
     path: { type: 'string' },
-    content: { type: 'string' }
+    content: { type: 'string', maxLength: RUN_LIMITS.generatedFileBytes }
   }
 };
 
@@ -112,6 +123,27 @@ function truncate(value: string, maxChars: number) {
 
 function isTruncationError(error: unknown) {
   return error instanceof Error && /truncated|finish_reason.*length|max_tokens|incomplete json|started a json object but did not finish/i.test(error.message);
+}
+
+function isOversizedGeneratedFileError(error: unknown): error is OversizedGeneratedFileError {
+  return error instanceof OversizedGeneratedFileError;
+}
+
+function fileSizeLimitInstruction() {
+  return `Each generated file content must stay under ${RUN_LIMITS.generatedFileBytes} bytes. Do not generate package lockfiles, vendored dependencies, build outputs, binary/base64 assets, screenshots, huge fixtures, or massive seed datasets. Use concise seed samples and document install/generation commands instead.`;
+}
+
+function generatedFileByteSize(file: Pick<GeneratedFile, 'content'>) {
+  return Buffer.byteLength(file.content, 'utf8');
+}
+
+function assertGeneratedFileWithinLimit(file: GeneratedFile): GeneratedFile {
+  const bytes = generatedFileByteSize(file);
+  if (bytes > RUN_LIMITS.generatedFileBytes) {
+    throw new OversizedGeneratedFileError(file.path, bytes, RUN_LIMITS.generatedFileBytes);
+  }
+
+  return file;
 }
 
 function getDevFileBatchSize() {
@@ -143,6 +175,17 @@ function findExistingFile(files: GeneratedFile[] | undefined, targetPath: string
   return files?.find((file) => normalizeGeneratedPath(file.path) === normalizeGeneratedPath(targetPath));
 }
 
+function mergeWithExistingFiles(generatedFiles: GeneratedFile[], existingFiles?: GeneratedFile[]) {
+  if (!existingFiles?.length) return generatedFiles;
+
+  const merged = new Map(existingFiles.map((file) => [normalizeGeneratedPath(file.path), file]));
+  for (const file of generatedFiles) {
+    merged.set(normalizeGeneratedPath(file.path), file);
+  }
+
+  return Array.from(merged.values());
+}
+
 function formatPreviousDevOutput(output?: DevOutput) {
   if (!output) return 'No previous DEV output.';
 
@@ -160,20 +203,56 @@ function formatPreviousDevOutput(output?: DevOutput) {
   );
 }
 
+function buildDevSystemAppend(params: {
+  projectDevSkill?: ProjectDevSkill | null;
+  preparedTechStack?: PreparedTechStackOutput;
+  enrichedSkillContext?: string;
+}) {
+  const parts: string[] = [];
+  if (params.enrichedSkillContext?.trim()) parts.push(params.enrichedSkillContext.trim());
+  if (params.projectDevSkill?.body?.trim()) parts.push(params.projectDevSkill.body.trim());
+  if (params.preparedTechStack) {
+    parts.push(`## Prepared Tech Stack Runtime Context
+This context was produced by the prepare-tech-stack skill after BA analysis. Treat it as the source of truth for stack choices unless explicit user requirements conflict with it.
+
+\`\`\`json
+${JSON.stringify(params.preparedTechStack, null, 2)}
+\`\`\``);
+  }
+
+  return parts.join('\n\n');
+}
+
 function selectScopedRepairPaths(params: {
   repairScope: RepairScope;
   qaFeedback: string;
 }) {
   const candidates = orderedUnique(params.repairScope.candidatePaths);
   const text = params.qaFeedback.toLowerCase();
-  const referenced = candidates.filter((filePath) => text.includes(normalizeGeneratedPath(filePath)) || text.includes(basename(filePath)));
-
-  if (referenced.length > 0) return referenced.slice(0, 6);
 
   if (params.repairScope.kind === 'docker') {
     const containerFiles = candidates.filter((filePath) => /(^|\/)(dockerfile|containerfile|(compose|docker-compose)\.ya?ml)$/i.test(filePath));
+    const scored = containerFiles
+      .map((filePath) => {
+        const normalized = normalizeGeneratedPath(filePath);
+        let score = 0;
+        if (text.includes(normalized)) score += 100;
+        if (/docker-compose\.ya?ml|compose\.ya?ml/.test(normalized) && /docker-compose\.ya?ml|compose\.ya?ml|compose/.test(text)) score += 80;
+        if (normalized.includes('/frontend/') && /frontend/i.test(text)) score += 40;
+        if (normalized.includes('/backend/') && /backend/i.test(text)) score += 40;
+        if (text.includes(basename(filePath))) score += 20;
+        return { filePath, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score);
+
+    if (scored.length > 0) return scored.map((item) => item.filePath).slice(0, 4);
     if (containerFiles.length > 0) return containerFiles.slice(0, 4);
   }
+
+  const referenced = candidates.filter((filePath) => text.includes(normalizeGeneratedPath(filePath)) || text.includes(basename(filePath)));
+
+  if (referenced.length > 0) return referenced.slice(0, 6);
 
   if (params.repairScope.kind === 'docs') {
     const docs = candidates.filter((filePath) => /(^|\/)(readme\.md|.*\.env\.example|\.env\.example)$/i.test(filePath));
@@ -198,7 +277,12 @@ function applyRepairScopeToManifest(manifest: DevManifest, repairScope?: RepairS
   if (!repairScope) return manifest;
 
   const filteredFiles = manifest.files.filter((file) => pathAllowedByRepairScope(file.path, repairScope));
-  if (filteredFiles.length > 0) return { ...manifest, files: filteredFiles };
+  if (filteredFiles.length > 0) {
+    return {
+      ...manifest,
+      files: filteredFiles.slice(0, repairScope.requiresPlanning ? 8 : 6)
+    };
+  }
 
   if (repairScope.requiresPlanning) return { ...manifest, files: [] };
 
@@ -232,33 +316,30 @@ function buildScopedRepairManifest(params: {
 function buildDevContext(input: {
   requirements: string;
   techSpec: string;
+  preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingCode: string;
+  projectOverview: string;
+  projectDevSkillStatus: string;
+  hasProjectDevSkill: boolean;
   previousDevOutput: string;
   runHistoryContext: string;
   qaFeedback: string;
   repairScope?: RepairScope;
   apiSpec?: string;
 }) {
+  const repairContext = input.repairScope
+    ? `
+REPAIR CONTEXT:
+QA or build feedback is present. Follow the repair rules in the loaded DEV skill, use the generated project overview as evidence, and choose the smallest file set that can address the reported failure.
+`
+    : '';
+
   return `
-If existing generated code is provided, update that existing project instead of creating a brand-new project layout.
-Return only files that should be created or overwritten in the fixed generated-code workspace.
-The generated code must be runnable locally after writing the returned files.
-Include all required manifests, dependency files, scripts, seed data, and configuration needed to run/build the app.
-Always include root README.md with exact setup, build, run, test, health-check, and port instructions.
-Always include root .env.example with safe local defaults only. Never include real credentials or secrets.
-For services owned by the generated project, include Dockerfiles unless containers are explicitly out of scope.
-Choose the database type from the requirements or tech spec. Do not default to PostgreSQL unless requested or clearly appropriate.
-If requirements say a database already exists or provide a connection string/API, treat it as external: document env vars, do not create/overwrite it, and avoid destructive schema changes.
-For local full-stack apps where Docker is appropriate, include a Compose file.
-For project-owned databases, include schema/migrations or an init script plus safe seed data.
-For external databases, include non-destructive connectivity checks and health/readiness handling instead of local database initialization.
-Include automated smoke tests and package scripts where supported.
-The generated frontend is started by this tool on port 3001 by default, and the backend on port 8000.
-Use a frontend API base URL environment variable such as NEXT_PUBLIC_API_BASE_URL or VITE_API_BASE_URL with a default of http://127.0.0.1:8000.
-FastAPI CORS must allow http://localhost:3001, http://127.0.0.1:3001, and the same origins on port 3000 for compatibility.
-Only say Compose initializes the database when the generated project actually owns and starts that database.
-If QA feedback is provided, preserve the existing project shape and return corrected files that address every blocking issue.
+Use the loaded DEV skill as the source of generation behavior, architecture rules, technology defaults, validation expectations, and repair rules.
+Application source only provides context and output-format constraints.
+If no project-specific skill is loaded, use the overall DEV skill for first generation.
+If existing generated code is provided, update that project according to the loaded skill and current request.
 
 REQUIREMENTS:
 ${input.requirements}
@@ -266,11 +347,20 @@ ${input.requirements}
 TECH SPEC:
 ${input.techSpec}
 
+PREPARED TECH STACK (SOURCE OF TRUTH WHEN PRESENT):
+${input.preparedTechStack ? JSON.stringify(input.preparedTechStack, null, 2) : 'Not prepared. If this is first generation, report this as a workflow issue and use safe skill defaults only when instructed by the orchestrator.'}
+
 BA OUTPUT:
 ${input.baOutput}
 
 EXISTING GENERATED CODE:
 ${input.existingCode}
+
+GENERATED PROJECT OVERVIEW:
+${input.projectOverview}
+
+PROJECT-SPECIFIC DEV SKILL STATUS:
+${input.projectDevSkillStatus}
 
 PREVIOUS DEV OUTPUT SUMMARY:
 ${input.previousDevOutput}
@@ -280,6 +370,8 @@ ${input.runHistoryContext}
 
 QA OR BUILD FEEDBACK TO FIX:
 ${input.qaFeedback}
+
+${repairContext}
 
 SCOPED REPAIR CONSTRAINTS:
 ${formatRepairScope(input.repairScope)}
@@ -291,8 +383,12 @@ ${input.apiSpec || 'Not provided'}
 
 async function requestDevManifest(params: {
   devContext: string;
+  projectDevSkill?: ProjectDevSkill | null;
+  preparedTechStack?: PreparedTechStackOutput;
+  enrichedSkillContext?: string;
   repairScope?: RepairScope;
   onProgress?: RunProgressReporter;
+  signal?: AbortSignal;
 }) {
   let lastError: unknown;
 
@@ -302,19 +398,27 @@ async function requestDevManifest(params: {
         agentId: 'dev',
         fallbackTemperature: 0.1,
         maxTokens: attempt === 1 ? 8_192 : 12_288,
+        systemAppend: buildDevSystemAppend({
+          projectDevSkill: params.projectDevSkill,
+          preparedTechStack: params.preparedTechStack,
+          enrichedSkillContext: params.enrichedSkillContext
+        }),
         jsonSchema: {
           name: 'dev_manifest',
           schema: DevManifestJsonSchema
         },
+        signal: params.signal,
         userPrompt: `
 Plan the implementation. Return JSON only.
 
 Return a compact manifest only: architecture, setupInstructions, and files with path + purpose.
 Do not include file content in this response.
 Keep setupInstructions concise. Avoid markdown lists inside JSON strings.
-Keep the file list minimal but complete enough for the project to build, run, test, and validate.
+Do not plan package lockfiles, vendored dependencies, build outputs, binary/base64 assets, screenshots, huge fixtures, or massive seed datasets unless explicitly required.
+Plan all files required by the loaded DEV skill, BA output, requirements, tech spec, and any repair scope.
+The file list must be complete enough for the generated project to satisfy the loaded skill and local validation.
 ${attempt > 1 ? 'Previous manifest response failed or was truncated. Return shorter valid JSON only.' : ''}
-${params.repairScope ? 'This is a scoped incremental repair. Prefer candidate files from SCOPED REPAIR CONSTRAINTS. If a new file is required, create it only inside one of the allowed generated-code directories listed there.' : ''}
+${params.repairScope ? 'This is a scoped incremental repair. Use QA OR BUILD FEEDBACK, GENERATED PROJECT OVERVIEW, and SCOPED REPAIR CONSTRAINTS to select the smallest useful file set allowed by the loaded DEV skill.' : ''}
 
 ${params.devContext}
 `
@@ -338,6 +442,7 @@ ${params.devContext}
 function buildBatchFileContext(input: {
   requirements: string;
   techSpec: string;
+  preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   qaFeedback: string;
   repairScope?: RepairScope;
@@ -345,6 +450,7 @@ function buildBatchFileContext(input: {
   manifestFiles: DevManifest['files'];
   existingFiles?: GeneratedFile[];
 }) {
+  const projectOverview = formatGeneratedProjectOverview(input.existingFiles ?? []);
   const existingSections = input.manifestFiles
     .map((manifestFile) => {
       const existingContent = findExistingFile(input.existingFiles, manifestFile.path)?.content;
@@ -355,8 +461,9 @@ function buildBatchFileContext(input: {
   return `
 PROJECT CONTRACT:
 - Generate complete, runnable files for the target paths only.
-- Match the database type and external-vs-owned database choice from requirements/tech spec.
-- Use environment variables for service/database connections.
+- Use the loaded DEV skill as the source of all generation rules and architecture requirements.
+- Use BA OUTPUT, requirements, tech spec, the manifest, and any repair feedback to decide the actual file content.
+- If this is a repair, preserve unrelated existing generated files and only change content needed for the scoped target file.
 - Do not include real secrets.
 - Keep each file focused and reasonably small.
 
@@ -372,17 +479,23 @@ ${truncate(input.manifest.setupInstructions, 3_000)}
 PROJECT FILE MANIFEST:
 ${input.manifest.files.map((file) => `- ${file.path}: ${file.purpose}`).join('\n')}
 
+GENERATED PROJECT OVERVIEW:
+${projectOverview}
+
 REQUIREMENTS EXCERPT:
 ${truncate(input.requirements, 4_000)}
 
 TECH SPEC EXCERPT:
 ${truncate(input.techSpec, 3_000)}
 
+PREPARED TECH STACK EXCERPT:
+${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), 6_000) : 'Not prepared.'}
+
 BA OUTPUT EXCERPT:
-${truncate(input.baOutput, 3_000)}
+${truncate(input.baOutput, 6_000)}
 
 QA OR BUILD FEEDBACK TO FIX:
-${truncate(input.qaFeedback, 4_000)}
+${truncate(input.qaFeedback, 16_000)}
 
 SCOPED REPAIR CONSTRAINTS:
 ${formatRepairScope(input.repairScope)}
@@ -406,7 +519,7 @@ function parseRawFileResponse(raw: string, expectedPath: string): GeneratedFile 
   const path = pathMatch?.[1]?.trim() || expectedPath;
   const content = raw.slice(start + startMarker.length, end).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 
-  return GeneratedFileSchema.parse({ path, content });
+  return assertGeneratedFileWithinLimit(GeneratedFileSchema.parse({ path, content }));
 }
 
 function parseGeneratedFileBatchResponse(raw: string, expectedFiles: DevManifest['files']): GeneratedFile[] {
@@ -421,18 +534,22 @@ function parseGeneratedFileBatchResponse(raw: string, expectedFiles: DevManifest
     throw new Error(`Generated batch path mismatch. Missing: ${missing.join(', ') || 'none'}. Extra: ${extras.join(', ') || 'none'}.`);
   }
 
-  return expectedPaths.map((filePath) => GeneratedFileSchema.parse(fileMap.get(normalizeGeneratedPath(filePath))));
+  return expectedPaths.map((filePath) => assertGeneratedFileWithinLimit(GeneratedFileSchema.parse(fileMap.get(normalizeGeneratedPath(filePath)))));
 }
 
 async function requestGeneratedFile(params: {
   input: {
     requirements: string;
     techSpec: string;
+    preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
     qaFeedback: string;
     repairScope?: RepairScope;
+    projectDevSkill?: ProjectDevSkill | null;
+    enrichedSkillContext?: string;
     onProgress?: RunProgressReporter;
+    signal?: AbortSignal;
   };
   manifest: DevManifest;
   manifestFile: DevManifest['files'][number];
@@ -440,6 +557,7 @@ async function requestGeneratedFile(params: {
   const batchContext = buildBatchFileContext({
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
+    preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
     repairScope: params.input.repairScope,
@@ -455,11 +573,17 @@ async function requestGeneratedFile(params: {
       const fileRaw = await runMarkdownSkillAgent({
         agentId: 'dev',
         fallbackTemperature: 0.1,
-        maxTokens: attempt === 1 ? 20_000 : 32_768,
+        maxTokens: attempt === 1 ? 32_768 : 65_536,
+        systemAppend: buildDevSystemAppend({
+          projectDevSkill: params.input.projectDevSkill,
+          preparedTechStack: params.input.preparedTechStack,
+          enrichedSkillContext: params.input.enrichedSkillContext
+        }),
         jsonSchema: {
           name: 'generated_file',
           schema: GeneratedFileJsonSchema
         },
+        signal: params.input.signal,
         userPrompt: `
 Generate exactly one complete file. Return JSON only.
 
@@ -473,8 +597,9 @@ Rules:
 - The path must be exactly ${params.manifestFile.path}.
 - The content must be the full file content, not a snippet.
 - Keep the file concise enough to fit in one response.
+- ${fileSizeLimitInstruction()}
 - Do not include markdown fences or commentary.
-${attempt > 1 ? '- Previous response failed or was truncated. Return a smaller complete implementation for this file.' : ''}
+${attempt > 1 ? '- Previous response failed, was truncated, or exceeded the file-size limit. Return a smaller complete implementation for this file.' : ''}
 
 ${batchContext}
 `
@@ -486,14 +611,17 @@ ${batchContext}
         throw new Error(`Generated file path mismatch. Expected ${params.manifestFile.path}, got ${parsed.path}.`);
       }
 
-      return parsed;
+      return assertGeneratedFileWithinLimit(parsed);
     } catch (error) {
       lastError = error;
+      const oversized = isOversizedGeneratedFileError(error);
       await params.input.onProgress?.({
         stepId: 'dev',
         stepStatus: 'RUNNING',
         level: 'warn',
-        message: `DEV retrying ${params.manifestFile.path}; ${isTruncationError(error) ? 'response was truncated' : 'provider returned invalid JSON'} on attempt ${attempt}.`
+        message: oversized
+          ? `DEV retrying ${params.manifestFile.path}; generated file was too large (${error.bytes}/${error.limit} bytes) on attempt ${attempt}.`
+          : `DEV retrying ${params.manifestFile.path}; ${isTruncationError(error) ? 'response was truncated' : 'provider returned invalid JSON'} on attempt ${attempt}.`
       });
     }
   }
@@ -501,7 +629,13 @@ ${batchContext}
   const rawFallback = await runMarkdownSkillAgent({
     agentId: 'dev',
     fallbackTemperature: 0.1,
-    maxTokens: 32_768,
+    maxTokens: 65_536,
+    systemAppend: buildDevSystemAppend({
+      projectDevSkill: params.input.projectDevSkill,
+      preparedTechStack: params.input.preparedTechStack,
+      enrichedSkillContext: params.input.enrichedSkillContext
+    }),
+    signal: params.input.signal,
     userPrompt: `
 Generate exactly one complete file using raw markers, not JSON.
 
@@ -515,6 +649,7 @@ Rules:
 - Do not wrap the response in markdown.
 - Do not add commentary before or after the markers.
 - Keep the file concise enough to fit in one response.
+- ${fileSizeLimitInstruction()}
 
 ${batchContext}
 
@@ -535,11 +670,15 @@ async function requestGeneratedFileBatch(params: {
   input: {
     requirements: string;
     techSpec: string;
+    preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
     qaFeedback: string;
     repairScope?: RepairScope;
+    projectDevSkill?: ProjectDevSkill | null;
+    enrichedSkillContext?: string;
     onProgress?: RunProgressReporter;
+    signal?: AbortSignal;
   };
   manifest: DevManifest;
   manifestFiles: DevManifest['files'];
@@ -559,6 +698,7 @@ async function requestGeneratedFileBatch(params: {
   const batchContext = buildBatchFileContext({
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
+    preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
     repairScope: params.input.repairScope,
@@ -572,11 +712,17 @@ async function requestGeneratedFileBatch(params: {
       const batchRaw = await runMarkdownSkillAgent({
         agentId: 'dev',
         fallbackTemperature: 0.1,
-        maxTokens: 32_768,
+        maxTokens: 65_536,
+        systemAppend: buildDevSystemAppend({
+          projectDevSkill: params.input.projectDevSkill,
+          preparedTechStack: params.input.preparedTechStack,
+          enrichedSkillContext: params.input.enrichedSkillContext
+        }),
         jsonSchema: {
           name: 'generated_file_batch',
           schema: GeneratedFileBatchJsonSchema
         },
+        signal: params.input.signal,
         userPrompt: `
 Generate a batch of complete files. Return JSON only.
 
@@ -591,8 +737,9 @@ Rules:
 - Return exactly these paths and no others: ${paths.join(', ')}
 - Each content value must be the full file content, not a snippet.
 - Keep files concise enough to fit in one response.
+- ${fileSizeLimitInstruction()}
 - Do not include markdown fences or commentary.
-${attempt > 1 ? '- Previous batch response failed or was too large. Return shorter complete implementations for the same files.' : ''}
+${attempt > 1 ? '- Previous batch response failed, was truncated, or exceeded the file-size limit. Return shorter complete implementations for the same files.' : ''}
 
 ${batchContext}
 `
@@ -601,16 +748,19 @@ ${batchContext}
       return parseGeneratedFileBatchResponse(batchRaw, params.manifestFiles);
     } catch (error) {
       const truncated = isTruncationError(error);
+      const oversized = isOversizedGeneratedFileError(error);
       await params.input.onProgress?.({
         stepId: 'dev',
         stepStatus: 'RUNNING',
         level: 'warn',
-        message: truncated
+        message: oversized
+          ? `DEV batch produced oversized ${error.filePath} (${error.bytes}/${error.limit} bytes); splitting into smaller batches.`
+          : truncated
           ? `DEV batch response was truncated for ${paths.join(', ')}; splitting into smaller batches.`
           : `DEV retrying batch ${paths.join(', ')}; provider returned invalid JSON on attempt ${attempt}.`
       });
 
-      if (truncated) break;
+      if (truncated || oversized) break;
     }
   }
 
@@ -633,25 +783,53 @@ ${batchContext}
 export async function runDevAgent(input: {
   requirements: string;
   techSpec?: string | null;
+  preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
   previousDevOutput?: DevOutput;
   qaFeedback?: string;
   repairScope?: RepairScope;
+  projectDevSkill?: ProjectDevSkill | null;
+  enrichedSkillContext?: string;
   apiSpec?: string;
   onProgress?: RunProgressReporter;
+  signal?: AbortSignal;
 }): Promise<DevOutput> {
   const techSpec = input.techSpec?.trim() || 'Not provided';
   const existingCode = formatGeneratedCodeContext(input.existingFiles ?? []);
+  const projectOverview = formatGeneratedProjectOverview(input.existingFiles ?? []);
   const runHistoryContext = formatRunHistoryContext(input.recentRuns ?? []);
   const previousDevOutput = formatPreviousDevOutput(input.previousDevOutput);
   const qaFeedback = input.qaFeedback?.trim() || 'No QA feedback yet.';
+  const projectDevSkillStatus = input.projectDevSkill
+    ? `Loaded project-specific dev skill for ${input.projectDevSkill.projectId} from ${input.projectDevSkill.path}. Use it to preserve stack, structure, commands, routes, env vars, and implemented features.`
+    : 'No project-specific dev skill is loaded. Use the overall DEV skill for first scaffold generation.';
+
+  await input.onProgress?.({
+    stepId: 'dev',
+    stepStatus: 'RUNNING',
+    level: 'info',
+    message: input.projectDevSkill ? `DEV using project-specific skill: ${input.projectDevSkill.path}` : 'DEV using overall dev skill; no project-specific skill exists yet.'
+  });
+
+  if (input.repairScope && (input.existingFiles?.length ?? 0) > 0) {
+    await input.onProgress?.({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      message: `DEV prepared generated project overview from ${input.existingFiles?.length ?? 0} file(s) before repair.`
+    });
+  }
+
   const devContext = buildDevContext({
     requirements: input.requirements,
     techSpec,
+    preparedTechStack: input.preparedTechStack,
     baOutput: input.baOutput,
     existingCode,
+    projectOverview,
+    projectDevSkillStatus,
+    hasProjectDevSkill: input.projectDevSkill !== null && input.projectDevSkill !== undefined,
     previousDevOutput,
     runHistoryContext,
     qaFeedback,
@@ -680,7 +858,11 @@ export async function runDevAgent(input: {
     manifest = await requestDevManifest({
       devContext,
       repairScope: input.repairScope,
-      onProgress: input.onProgress
+      onProgress: input.onProgress,
+      projectDevSkill: input.projectDevSkill,
+      preparedTechStack: input.preparedTechStack,
+      enrichedSkillContext: input.enrichedSkillContext,
+      signal: input.signal
     });
   }
 
@@ -711,11 +893,15 @@ export async function runDevAgent(input: {
       input: {
         requirements: input.requirements,
         techSpec,
+        preparedTechStack: input.preparedTechStack,
         baOutput: input.baOutput,
         existingFiles: input.existingFiles,
         qaFeedback,
         repairScope: input.repairScope,
-        onProgress: input.onProgress
+        projectDevSkill: input.projectDevSkill,
+        enrichedSkillContext: input.enrichedSkillContext,
+        onProgress: input.onProgress,
+        signal: input.signal
       },
       manifest,
       manifestFiles: batch
@@ -733,9 +919,10 @@ export async function runDevAgent(input: {
   }
 
   await input.onProgress?.({ stepId: 'dev', stepStatus: 'PASS', level: 'success', message: 'DEV generated all planned files.' });
+  const outputFiles = input.repairScope ? mergeWithExistingFiles(files, input.existingFiles) : files;
   return DevOutputSchema.parse({
     architecture: manifest.architecture,
-    files,
+    files: outputFiles,
     setupInstructions: manifest.setupInstructions
   });
 }

@@ -1,8 +1,8 @@
 import { runMarkdownSkillAgent } from './base-agent';
-import { formatGeneratedCodeContext, formatRunHistoryContext } from '@/lib/context/agent-context';
+import { formatGeneratedProjectOverview, formatRunHistoryContext } from '@/lib/context/agent-context';
 import { extractJsonObject } from '@/lib/utils/json';
 import { z } from 'zod';
-import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, QAReviewOutput, RunResult } from '@/lib/types';
+import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, RunResult } from '@/lib/types';
 
 const QAReviewOutputSchema = z.object({
   status: z.enum(['PASS', 'NEEDS_FIX']),
@@ -29,73 +29,175 @@ const QAReviewJsonSchema = {
   }
 };
 
+function truncate(value: string, maxChars: number) {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+}
+
+function isTruncationError(error: unknown) {
+  return error instanceof Error && /truncated|finish_reason.*length|max_tokens|incomplete json|started a json object but did not finish/i.test(error.message);
+}
+
+function fileName(filePath: string) {
+  const normalized = filePath.replace(/\\/g, '/');
+  return normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase();
+}
+
+function isQaRelevantFile(file: GeneratedFile) {
+  const name = fileName(file.path);
+  const normalized = file.path.replace(/\\/g, '/').toLowerCase();
+  return (
+    name === 'readme.md' ||
+    name === '.env.example' ||
+    name.endsWith('.env.example') ||
+    name === 'package.json' ||
+    name === 'requirements.txt' ||
+    name === 'pyproject.toml' ||
+    name === 'dockerfile' ||
+    name === 'containerfile' ||
+    /^(compose|docker-compose)\.ya?ml$/.test(name) ||
+    /(^|\/)(main|app|server|database|models|schemas|seed)[._-]?[a-z0-9]*\.(py|ts|tsx|js|jsx)$/.test(normalized) ||
+    /(^|\/)(tests?|__tests__)\/|(\.|_)(test|spec)\./.test(normalized)
+  );
+}
+
+function formatFileInventory(files: GeneratedFile[]) {
+  if (files.length === 0) return 'No generated files.';
+
+  return files
+    .map((file) => `- ${file.path} (${Buffer.byteLength(file.content, 'utf8')} bytes)`)
+    .join('\n');
+}
+
+function formatRelevantFileExcerpts(files: GeneratedFile[], compact: boolean) {
+  const limit = compact ? 8 : 14;
+  const charsPerFile = compact ? 1_000 : 2_000;
+  const relevant = files.filter(isQaRelevantFile).slice(0, limit);
+  if (relevant.length === 0) return 'No QA-relevant file excerpts were selected.';
+
+  return relevant
+    .map((file) => `### ${file.path}\n\`\`\`\n${truncate(file.content, charsPerFile)}\n\`\`\``)
+    .join('\n\n');
+}
+
+function formatDevOutputSummary(output: DevOutput, compact: boolean) {
+  return [
+    `Architecture:\n${truncate(output.architecture, compact ? 1_500 : 3_000)}`,
+    `Setup instructions:\n${truncate(output.setupInstructions, compact ? 1_500 : 3_000)}`,
+    `Generated file inventory:\n${formatFileInventory(output.files)}`
+  ].join('\n\n');
+}
+
+function formatExecutionValidationSummary(validation: GeneratedExecutionValidationResult | undefined, compact: boolean) {
+  if (!validation) return 'Not provided.';
+
+  const steps = validation.steps
+    .map((step) => {
+      const logFile = step.logFile ? ` log=${step.logFile}` : '';
+      return `- ${step.name}: ${step.status}${logFile}\n  ${truncate(step.message, compact ? 500 : 1_000)}`;
+    })
+    .join('\n');
+
+  return [
+    `Status: ${validation.status}`,
+    `Workspace: ${validation.workspace}`,
+    `Findings:\n${validation.findings.length ? validation.findings.map((finding) => `- ${truncate(finding, compact ? 500 : 1_000)}`).join('\n') : '- none'}`,
+    `Steps:\n${steps}`
+  ].join('\n\n');
+}
+
+function buildQaPrompt(input: {
+  requirements: string;
+  techSpec: string;
+  preparedTechStack?: PreparedTechStackOutput;
+  baOutput: string;
+  devOutput: DevOutput;
+  existingFiles: GeneratedFile[];
+  recentRuns: RunResult[];
+  executionValidation?: GeneratedExecutionValidationResult;
+  compact: boolean;
+}) {
+  return `
+Use the loaded QA skill to validate the generated delivery and produce QA artifacts.
+
+Return JSON only.
+
+Apply the QA skill as the source of review behavior, blocking criteria, validation expectations, and report structure.
+The application source only provides context below. Do not infer extra QA policy from this prompt.
+Keep findings, fixInstructions, and report concise. If status is "NEEDS_FIX", address fixInstructions to the DEV agent.
+
+REQUIREMENTS:
+${truncate(input.requirements, input.compact ? 1_500 : 3_000)}
+
+TECH SPEC:
+${truncate(input.techSpec, input.compact ? 1_000 : 2_000)}
+
+PREPARED TECH STACK:
+${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), input.compact ? 1_500 : 3_000) : 'Not provided.'}
+
+BA OUTPUT:
+${truncate(input.baOutput, input.compact ? 2_000 : 4_000)}
+
+DEV OUTPUT SUMMARY:
+${formatDevOutputSummary(input.devOutput, input.compact)}
+
+GENERATED PROJECT OVERVIEW:
+${formatGeneratedProjectOverview(input.existingFiles)}
+
+EXECUTION VALIDATION RESULT:
+${formatExecutionValidationSummary(input.executionValidation, input.compact)}
+
+QA-RELEVANT GENERATED FILE EXCERPTS:
+${formatRelevantFileExcerpts(input.existingFiles, input.compact)}
+
+RECENT RUN HISTORY:
+${truncate(formatRunHistoryContext(input.recentRuns), input.compact ? 3_000 : 5_000)}
+`;
+}
+
 export async function runQAAgent(input: {
   requirements: string;
   techSpec?: string | null;
+  preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   devOutput: DevOutput;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
   executionValidation?: GeneratedExecutionValidationResult;
+  signal?: AbortSignal;
 }): Promise<QAReviewOutput> {
   const techSpec = input.techSpec?.trim() || 'Not provided';
-  const existingCodeContext = formatGeneratedCodeContext(input.existingFiles ?? []);
-  const runHistoryContext = formatRunHistoryContext(input.recentRuns ?? []);
+  let lastError: unknown;
 
-  const raw = await runMarkdownSkillAgent({
-    agentId: 'qa',
-    maxTokens: 16_384,
-    jsonSchema: {
-      name: 'qa_review_output',
-      schema: QAReviewJsonSchema
-    },
-    userPrompt: `
-Validate the Phase 1 delivery and produce QA artifacts.
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const raw = await runMarkdownSkillAgent({
+        agentId: 'qa',
+        maxTokens: attempt === 1 ? 12_288 : 16_384,
+        jsonSchema: {
+          name: 'qa_review_output',
+          schema: QAReviewJsonSchema
+        },
+        signal: input.signal,
+        userPrompt: buildQaPrompt({
+          requirements: input.requirements,
+          techSpec,
+          preparedTechStack: input.preparedTechStack,
+          baOutput: input.baOutput,
+          devOutput: input.devOutput,
+          existingFiles: input.existingFiles ?? [],
+          recentRuns: input.recentRuns ?? [],
+          executionValidation: input.executionValidation,
+          compact: attempt > 1
+        })
+      });
 
-Return JSON only.
+      return QAReviewOutputSchema.parse(extractJsonObject(raw));
+    } catch (error) {
+      lastError = error;
+      if (!isTruncationError(error) && attempt > 1) break;
+    }
+  }
 
-Use status "NEEDS_FIX" if generated files are not locally runnable/buildable, missing dependency manifests,
-missing setup commands, likely fail at runtime, fail to satisfy acceptance criteria, or have blocking integration bugs.
-Use status "PASS" only if the generated delivery appears complete, runnable, and aligned to scope.
-
-For setup/build readiness, inspect whether the DEV output includes the files needed to run the generated app:
-- Every generated project needs root README.md and .env.example.
-- Every generated service owned by the project needs a Dockerfile unless containers are out of scope.
-- Docker Compose is required only when generated, requested, or appropriate for local project-owned services/databases.
-- Frontend projects need package.json and runnable scripts.
-- Tailwind projects need Tailwind/PostCSS config.
-- FastAPI projects need requirements.txt and an app entrypoint.
-- The database type must match requirements or tech spec.
-- Project-owned databases need migrations/schema initialization and safe seed data when needed.
-- External/pre-existing databases need documented env vars, non-destructive connection handling, and health/connectivity checks; they should not be recreated or seeded destructively.
-- Generated projects need smoke tests and documented test commands.
-- Frontend/backend integration needs matching API URLs and CORS where applicable.
-- The orchestrator starts generated frontend on port 3001 and backend on port 8000 by default; FastAPI CORS should allow localhost/127.0.0.1 on port 3001.
-
-If status is "NEEDS_FIX", provide concise fixInstructions addressed to the DEV agent.
-
-REQUIREMENTS:
-${input.requirements}
-
-TECH SPEC:
-${techSpec}
-
-BA OUTPUT:
-${input.baOutput}
-
-DEV OUTPUT:
-${JSON.stringify(input.devOutput, null, 2)}
-
-EXECUTION VALIDATION RESULT:
-${input.executionValidation ? JSON.stringify(input.executionValidation, null, 2) : 'Not provided.'}
-
-CURRENT GENERATED CODE SNAPSHOT:
-${existingCodeContext}
-
-RECENT RUN HISTORY:
-${runHistoryContext}
-`
-  });
-
-  return QAReviewOutputSchema.parse(extractJsonObject(raw));
+  throw lastError instanceof Error ? lastError : new Error('QA response was invalid JSON.');
 }

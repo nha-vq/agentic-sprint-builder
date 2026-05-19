@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { RUN_LIMITS } from '@/lib/config/limits';
 import { createTimestampRunId, runSprintBuilder } from '@/lib/orchestrator';
-import { completeRunStatus, createRunStatus, failRunStatus, updateRunProgress } from '@/lib/runs/run-status-store';
+import { clearRunController, completeRunStatus, createRunStatus, failRunStatus, isRunCanceled, registerRunController, updateRunProgress } from '@/lib/runs/run-status-store';
 import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
 
 export const runtime = 'nodejs';
@@ -12,7 +12,8 @@ const RunRequestSchema = z.object({
   requirements: z.string().min(10).max(RUN_LIMITS.requirementsChars),
   techSpec: z.string().max(RUN_LIMITS.techSpecChars).nullable().optional(),
   apiSpec: z.string().max(RUN_LIMITS.apiSpecChars).optional(),
-  topic: z.string().max(RUN_LIMITS.topicChars).optional()
+  topic: z.string().max(RUN_LIMITS.topicChars).optional(),
+  projectId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(80).optional()
 });
 
 function errorResponse(error: unknown) {
@@ -53,17 +54,25 @@ export async function POST(request: NextRequest) {
     }
 
     const runId = `${createTimestampRunId()}-${Math.random().toString(36).slice(2, 7)}`;
-    const topic = body.topic || 'Simple Shopping Cart App';
+    const topic = body.topic || 'AI Team Run';
     const snapshot = createRunStatus(runId, topic);
+    const controller = new AbortController();
+    registerRunController(runId, controller);
 
     void runSprintBuilder(body, {
       runId,
+      signal: controller.signal,
       onProgress: (update) => {
         updateRunProgress(runId, update);
       }
     })
-      .then((result) => completeRunStatus(runId, result))
+      .then((result) => {
+        clearRunController(runId);
+        completeRunStatus(runId, result);
+      })
       .catch((error) => {
+        clearRunController(runId);
+        if (isRunCanceled(runId)) return;
         console.error('[runs] Background run failed', error);
         failRunStatus(runId, error);
       });

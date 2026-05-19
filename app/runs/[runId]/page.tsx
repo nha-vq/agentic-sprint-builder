@@ -7,6 +7,7 @@ export const dynamic = 'force-dynamic';
 export default async function RunOutputPage({ params }: { params: { runId: string } }) {
   const result = await readRunResult(params.runId);
   if (!result) notFound();
+  const frontendUrl = getGeneratedFrontendUrl(result);
 
   return (
     <main className="min-h-screen p-6">
@@ -29,6 +30,11 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
               <RuntimeStatus result={result} />
             </div>
             <div className="flex flex-wrap gap-3">
+              {frontendUrl && (
+                <a href={frontendUrl} target="_blank" rel="noreferrer" className="rounded-2xl bg-blue-600 px-5 py-3 font-semibold text-white hover:bg-blue-700">
+                  Open generated page
+                </a>
+              )}
               <Link href="/runs" className="rounded-2xl border border-slate-200 px-5 py-3 font-semibold hover:bg-slate-50">
                 All Runs
               </Link>
@@ -66,6 +72,18 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
       </div>
     </main>
   );
+}
+
+function firstUrl(value: string | undefined) {
+  return value?.match(/https?:\/\/[^\s"'<>),]+/)?.[0];
+}
+
+function getGeneratedFrontendUrl(result: NonNullable<Awaited<ReturnType<typeof readRunResult>>>) {
+  const runtimeUrl = result.runtime?.services.find((service) => service.name === 'frontend' && service.url)?.url;
+  if (runtimeUrl) return runtimeUrl;
+
+  const frontendHealth = result.executionValidation?.steps.find((step) => step.name.toLowerCase().includes('frontend') && step.status === 'PASS');
+  return firstUrl(frontendHealth?.message) || firstUrl(frontendHealth?.command);
 }
 
 function ExecutionValidationStatus({ result }: { result: Awaited<ReturnType<typeof readRunResult>> }) {

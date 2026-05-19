@@ -7,6 +7,7 @@ export async function runBAAgent(input: {
   techSpec?: string | null;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
+  signal?: AbortSignal;
 }) {
   const techSpec = input.techSpec?.trim() || 'Not provided';
   const existingCodeContext = formatGeneratedCodeContext(input.existingFiles ?? []);
@@ -14,8 +15,10 @@ export async function runBAAgent(input: {
 
   return runMarkdownSkillAgent({
     agentId: 'ba',
+    signal: input.signal,
     userPrompt: `
-Analyze these Phase 1 inputs and produce BA artifacts.
+Use the loaded BA skill to analyze the provided context and produce the structured BA output required by that skill.
+Application source only provides context below; BA behavior, assumptions, and output requirements come from the loaded skill.
 
 REQUIREMENTS:
 ${input.requirements}

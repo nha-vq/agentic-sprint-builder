@@ -15,11 +15,12 @@ export interface LoadedSkill {
   raw: string;
   meta: z.infer<typeof SkillMetaSchema>;
   body: string;
+  sourcePath?: string;
 }
 
-function parseFrontMatter(markdown: string): LoadedSkill {
+export function parseSkillMarkdown(markdown: string, sourcePath?: string): LoadedSkill {
   const match = markdown.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) return { raw: markdown, meta: {}, body: markdown };
+  if (!match) return { raw: markdown, meta: {}, body: markdown, sourcePath };
 
   const meta: Record<string, string> = {};
   for (const line of match[1].split('\n')) {
@@ -31,12 +32,34 @@ function parseFrontMatter(markdown: string): LoadedSkill {
   return {
     raw: markdown,
     meta: SkillMetaSchema.parse(meta),
-    body: match[2]
+    body: match[2],
+    sourcePath
   };
 }
 
+async function firstExistingPath(paths: string[]) {
+  for (const filePath of paths) {
+    try {
+      await fs.access(filePath);
+      return filePath;
+    } catch {
+      // Try the next convention.
+    }
+  }
+
+  return null;
+}
+
 export async function loadSkill(agentId: AgentId): Promise<LoadedSkill> {
-  const filePath = path.join(process.cwd(), 'skills', `${agentId}.md`);
+  const filePath = await firstExistingPath([
+    path.join(process.cwd(), '.github', 'skills', agentId, 'SKILL.md'),
+    path.join(process.cwd(), '.github', 'skills', `${agentId}.md`)
+  ]);
+
+  if (!filePath) {
+    throw new Error(`Missing skill for ${agentId}. Expected .github/skills/${agentId}/SKILL.md or .github/skills/${agentId}.md.`);
+  }
+
   const markdown = await fs.readFile(filePath, 'utf-8');
-  return parseFrontMatter(markdown);
+  return parseSkillMarkdown(markdown, filePath);
 }
