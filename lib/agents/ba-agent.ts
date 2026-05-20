@@ -1,10 +1,11 @@
 import { runMarkdownSkillAgent } from './base-agent';
 import { formatGeneratedCodeContext, formatRunHistoryContext } from '@/lib/context/agent-context';
-import type { GeneratedFile, RunResult } from '@/lib/types';
+import type { GeneratedFile, RequirementImage, RunResult } from '@/lib/types';
 
 export async function runBAAgent(input: {
   requirements: string;
   techSpec?: string | null;
+  requirementImages?: RequirementImage[] | null;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
   signal?: AbortSignal;
@@ -12,10 +13,14 @@ export async function runBAAgent(input: {
   const techSpec = input.techSpec?.trim() || 'Not provided';
   const existingCodeContext = formatGeneratedCodeContext(input.existingFiles ?? []);
   const runHistoryContext = formatRunHistoryContext(input.recentRuns ?? []);
+  const imageContext = input.requirementImages?.length
+    ? `\nATTACHED IMAGES: ${input.requirementImages.length} requirement image(s) attached. Analyze them as UI mockups/wireframes/screenshots to understand the visual design, layout, components, and user flow requirements.`
+    : '';
 
   return runMarkdownSkillAgent({
     agentId: 'ba',
     signal: input.signal,
+    images: input.requirementImages ?? undefined,
     userPrompt: `
 Use the loaded BA skill to analyze the provided context and produce the structured BA output required by that skill.
 Application source only provides context below; BA behavior, assumptions, and output requirements come from the loaded skill.
@@ -25,6 +30,7 @@ ${input.requirements}
 
 TECH SPEC:
 ${techSpec}
+${imageContext}
 
 EXISTING GENERATED CODE:
 ${existingCodeContext}

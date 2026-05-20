@@ -20,12 +20,22 @@ export interface AgentEvent {
   dashboardAccepted?: boolean;
 }
 
+export interface RequirementImage {
+  name: string;
+  mimeType: 'image/png' | 'image/jpeg' | 'image/webp';
+  sizeBytes: number;
+  dataUrl: string;
+}
+
+export type RequirementImageMetadata = Omit<RequirementImage, 'dataUrl'>;
+
 export interface RunRequest {
   requirements: string;
   techSpec?: string | null;
   apiSpec?: string;
   topic?: string;
   projectId?: string;
+  requirementImages?: RequirementImage[] | null;
 }
 
 export type RunJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELED';

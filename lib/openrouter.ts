@@ -1,6 +1,7 @@
 interface OpenRouterInput {
   system: string;
   user: string;
+  images?: Array<{ dataUrl: string }>;
   model?: string;
   temperature?: number;
   maxTokens?: number;
@@ -17,7 +18,7 @@ interface OpenRouterRequestBody {
   max_tokens: number;
   messages: Array<{
     role: 'system' | 'user';
-    content: string;
+    content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
   }>;
   response_format?: {
     type: 'json_schema';
@@ -60,13 +61,24 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
 
   const model = input.model || process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
   const maxTokens = input.maxTokens ?? readPositiveIntEnv('OPENROUTER_MAX_TOKENS', DEFAULT_MAX_TOKENS);
+
+  const userContent = input.images?.length
+    ? [
+        { type: 'text' as const, text: input.user },
+        ...input.images.map((image) => ({
+          type: 'image_url' as const,
+          image_url: { url: image.dataUrl }
+        }))
+      ]
+    : input.user;
+
   const requestBody: OpenRouterRequestBody = {
     model,
     temperature: input.temperature ?? 0.2,
     max_tokens: maxTokens,
     messages: [
       { role: 'system', content: input.system },
-      { role: 'user', content: input.user }
+      { role: 'user', content: userContent }
     ]
   };
 

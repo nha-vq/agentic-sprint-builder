@@ -1,10 +1,11 @@
 import { loadSkill } from '@/lib/skills/loadSkill';
 import { callOpenRouter } from '@/lib/openrouter';
-import type { AgentId } from '@/lib/types';
+import type { AgentId, RequirementImage } from '@/lib/types';
 
 export async function runMarkdownSkillAgent(params: {
   agentId: AgentId;
   userPrompt: string;
+  images?: RequirementImage[];
   fallbackModel?: string;
   fallbackTemperature?: number;
   maxTokens?: number;
@@ -21,6 +22,7 @@ export async function runMarkdownSkillAgent(params: {
   return callOpenRouter({
     system,
     user: params.userPrompt,
+    images: params.images,
     model: skill.meta.model || params.fallbackModel,
     temperature: skill.meta.temperature ?? params.fallbackTemperature ?? 0.2,
     maxTokens: params.maxTokens,

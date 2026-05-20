@@ -2,30 +2,53 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import type { RunResult, RunStatusSnapshot } from '@/lib/types';
+import type { RequirementImage, RunResult, RunStatusSnapshot } from '@/lib/types';
 
-const DEFAULT_REQUIREMENTS = `# New Full-Stack App
+const DEFAULT_REQUIREMENTS = `# Simple Shopping Cart App
 
 ## Overview
-Describe the app users, core workflow, data, UI, backend, database, API, auth, and runtime/deployment needs here.
+
+Build a full-stack Watch shopping cart app.
 
 ## In Scope
-List the features the AI team should implement.
+
+Only implement features defined below.
 
 ### Features
-1. Primary user flow.
-2. Supporting data/API flow.
-3. Local deploy and smoke-check flow.
+
+Only implement 2 pages:
+
+1. **Home Page** – Product list page.
+2. **Product Detail Page** – View details of a product.
+
+Mockup files are provided for:
+- UI/UX
+- Layout: Header, Footer, Navigation Bar, and Menu
 
 ## Out of Scope
-- Features not listed above
-- Real credentials or destructive production data changes`;
 
-const DEFAULT_TECH_SPEC = '';
+- NFRs
+- Implementing all features shown in mockups`;
+
+const DEFAULT_TECH_SPEC = `# Simple Shopping Cart App
+
+## Overview
+
+Build a full-stack the shopping cart app.
+
+### Technical Stack
+
+| Layer    | Technology           |
+|----------|----------------------|
+| Frontend | Next.js + Tailwind CSS |
+| Backend  | FastAPI + SQLModel   |
+| Database | SQLite               |`;
 
 export default function HomePage() {
   const [requirements, setRequirements] = useState(DEFAULT_REQUIREMENTS);
   const [techSpec, setTechSpec] = useState(DEFAULT_TECH_SPEC);
+  const [requirementImages, setRequirementImages] = useState<RequirementImage[]>([]);
+  const [cleanBeforeRun, setCleanBeforeRun] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
   const [liveStatus, setLiveStatus] = useState<RunStatusSnapshot | null>(null);
   const [progressModalOpen, setProgressModalOpen] = useState(false);
@@ -69,12 +92,16 @@ export default function HomePage() {
     setLiveStatus(null);
     setProgressModalOpen(true);
     try {
+      if (cleanBeforeRun) {
+        await fetch('/api/runs/cleanup', { method: 'POST' });
+      }
       const response = await fetch('/api/runs?async=true', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           requirements,
           techSpec: techSpec.trim() ? techSpec : null,
+          requirementImages: requirementImages.length > 0 ? requirementImages : null,
           topic: 'New Full-Stack App'
         })
       });
@@ -155,10 +182,21 @@ export default function HomePage() {
           <Editor title="tech-spec.md optional" value={techSpec} onChange={setTechSpec} />
         </section>
 
-        <div className="flex items-center gap-3">
+        <RequirementImageInput images={requirementImages} onChange={setRequirementImages} />
+
+        <div className="flex items-center gap-4">
           <button disabled={loading} onClick={runAgents} className="rounded-2xl bg-blue-600 px-6 py-3 font-semibold text-white shadow-sm hover:bg-blue-700 disabled:opacity-60">
             {loading ? 'Running AI Team...' : 'Run AI Team'}
           </button>
+          <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 hover:bg-slate-50">
+            <input
+              type="checkbox"
+              checked={cleanBeforeRun}
+              onChange={(e) => setCleanBeforeRun(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300 text-blue-600"
+            />
+            <span className="text-sm font-medium text-slate-700">Clean generated-code &amp; generated-runs before run</span>
+          </label>
           {error && <p className="text-sm font-medium text-red-600">{error}</p>}
         </div>
 
@@ -189,6 +227,95 @@ function Editor(props: { title: string; value: string; onChange: (value: string)
         onChange={(event) => props.onChange(event.target.value)}
       />
     </label>
+  );
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function RequirementImageInput({ images, onChange }: { images: RequirementImage[]; onChange: (images: RequirementImage[]) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const MAX_IMAGES = 8;
+  const MAX_SIZE = 5 * 1024 * 1024;
+
+  async function handleFiles(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    if (inputRef.current) inputRef.current.value = '';
+
+    const newImages: RequirementImage[] = [];
+    for (const file of files) {
+      if (images.length + newImages.length >= MAX_IMAGES) break;
+      if (file.size > MAX_SIZE) continue;
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) continue;
+
+      const dataUrl = await readFileAsDataUrl(file);
+      newImages.push({
+        name: file.name,
+        mimeType: file.type as RequirementImage['mimeType'],
+        sizeBytes: file.size,
+        dataUrl
+      });
+    }
+
+    onChange([...images, ...newImages]);
+  }
+
+  function removeImage(index: number) {
+    onChange(images.filter((_, i) => i !== index));
+  }
+
+  return (
+    <section className="rounded-3xl bg-white p-5 shadow-sm">
+      <div className="flex items-center justify-between">
+        <div>
+          <span className="font-semibold">Requirement Images</span>
+          <span className="ml-2 text-sm text-slate-500">(UI mockups, wireframes, screenshots — max {MAX_IMAGES}, 5MB each)</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => inputRef.current?.click()}
+          disabled={images.length >= MAX_IMAGES}
+          className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-40"
+        >
+          + Add Images
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept="image/png,image/jpeg,image/webp"
+          className="hidden"
+          onChange={handleFiles}
+        />
+      </div>
+      {images.length > 0 && (
+        <div className="mt-4 flex flex-wrap gap-3">
+          {images.map((image, index) => (
+            <div key={`${image.name}-${index}`} className="group relative">
+              <img
+                src={image.dataUrl}
+                alt={image.name}
+                className="h-24 w-24 rounded-xl border border-slate-200 object-cover"
+              />
+              <button
+                type="button"
+                onClick={() => removeImage(index)}
+                className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs text-white opacity-0 transition-opacity group-hover:opacity-100"
+              >
+                ×
+              </button>
+              <p className="mt-1 max-w-[96px] truncate text-xs text-slate-500">{image.name}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

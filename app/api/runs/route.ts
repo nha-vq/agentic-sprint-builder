@@ -8,12 +8,23 @@ import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
 export const runtime = 'nodejs';
 export const maxDuration = 900;
 
+const RequirementImageSchema = z.object({
+  name: z.string().min(1).max(255),
+  mimeType: z.enum(['image/png', 'image/jpeg', 'image/webp']),
+  sizeBytes: z.number().int().positive().max(RUN_LIMITS.requirementImageBytes),
+  dataUrl: z.string().min(1).refine(
+    (value) => /^data:image\/(png|jpeg|webp);base64,/.test(value),
+    'dataUrl must be a valid base64 data URL with image mime type'
+  )
+});
+
 const RunRequestSchema = z.object({
   requirements: z.string().min(10).max(RUN_LIMITS.requirementsChars),
   techSpec: z.string().max(RUN_LIMITS.techSpecChars).nullable().optional(),
   apiSpec: z.string().max(RUN_LIMITS.apiSpecChars).optional(),
   topic: z.string().max(RUN_LIMITS.topicChars).optional(),
-  projectId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(80).optional()
+  projectId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(80).optional(),
+  requirementImages: z.array(RequirementImageSchema).max(RUN_LIMITS.requirementImages).nullable().optional()
 });
 
 function errorResponse(error: unknown) {

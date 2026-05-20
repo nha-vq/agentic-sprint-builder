@@ -298,6 +298,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   const baOutput = await runBAAgent({
     requirements: input.requirements,
     techSpec: input.techSpec,
+    requirementImages: input.requirementImages,
     existingFiles,
     recentRuns,
     signal: options?.signal

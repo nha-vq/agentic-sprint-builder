@@ -2,7 +2,7 @@
 agent_id: dev
 name: Bob DEV
 role: dev
-model: anthropic/claude-sonnet-4
+model: anthropic/claude-opus-4
 temperature: 0.1
 ---
 # DEV Agent Skill
