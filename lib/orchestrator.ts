@@ -1,4 +1,4 @@
-import { emitDashboardEvent } from '@/lib/dashboard';
+import { emitDashboardEvent, registerDashboardCompany } from '@/lib/dashboard';
 import { runBAAgent } from '@/lib/agents/ba-agent';
 import { runDevAgent } from '@/lib/agents/dev-agent';
 import { runCodeReviewAgent, type CodeReviewOutput } from '@/lib/agents/code-review-agent';
@@ -247,6 +247,16 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   const events: AgentEvent[] = [];
   const topic = input.topic || 'AI Team Run';
   const projectId = input.projectId || DEFAULT_PROJECT_ID;
+
+  // Auto-register company on dashboard at the start of each run
+  try {
+    const reg = await registerDashboardCompany();
+    if (reg.company_id && !reg.dashboardDisabled) {
+      console.log(`[Dashboard] Registered company "${reg.name}" → ${reg.company_id}`);
+    }
+  } catch (e) {
+    console.warn('[Dashboard] Auto-register failed, continuing without dashboard:', e instanceof Error ? e.message : e);
+  }
 
   async function progress(update: Parameters<RunProgressReporter>[0]) {
     throwIfCanceled(options?.signal);
@@ -596,7 +606,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     });
   }
 
-  await emit({ agentId: 'qa', eventType: 'REVIEWING', task: 'Run generated project build/deploy smoke validation', artifact: 'generated-validation' });
+  await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: 'Run generated project build/deploy smoke validation', artifact: 'generated-validation' });
   await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: 'Running generated project build/deploy smoke validation.' });
   executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
 
@@ -659,7 +669,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     buildReadiness = validateGeneratedProject(devOutput);
     await reportStaticReadiness(options?.onProgress, buildReadiness, `Static readiness check after execution fix ${executionValidationFixIterations}`);
 
-    await emit({ agentId: 'qa', eventType: 'REVIEWING', task: `Re-run generated project execution validation iteration ${executionValidationFixIterations}`, artifact: 'generated-validation' });
+    await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: `Re-run generated project execution validation iteration ${executionValidationFixIterations}`, artifact: 'generated-validation' });
     await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: `Re-running generated project build/deploy smoke validation iteration ${executionValidationFixIterations}.` });
     executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
   }
@@ -787,7 +797,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
         message: `Static readiness still has ${buildReadiness.findings.length} issue(s) after QA fix; continuing deploy-first build/run validation.`
       });
     }
-    await emit({ agentId: 'qa', eventType: 'REVIEWING', task: `Re-run execution validation after QA fix iteration ${qaFixIterations}`, artifact: 'generated-validation' });
+    await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: `Re-run execution validation after QA fix iteration ${qaFixIterations}`, artifact: 'generated-validation' });
     await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: `Re-running generated project build/deploy smoke validation after QA fix iteration ${qaFixIterations}.` });
     executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
     await progress({

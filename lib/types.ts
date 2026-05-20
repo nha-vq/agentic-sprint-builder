@@ -4,6 +4,7 @@ export type DashboardEventType =
   | 'THINKING'
   | 'WORKING'
   | 'CODING'
+  | 'EXECUTING'
   | 'REVIEWING'
   | 'WORK_COMPLETE'
   | 'REVIEW_REQUEST'

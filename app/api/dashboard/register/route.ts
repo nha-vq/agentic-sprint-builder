@@ -8,7 +8,9 @@ export async function POST() {
     const result = await registerDashboardCompany();
     return NextResponse.json({
       ...result,
-      nextStep: 'Copy company_id into DASHBOARD_COMPANY_ID in .env.local and restart dev server.'
+      info: result.dashboardDisabled
+        ? 'Dashboard is disabled (ENABLE_DASHBOARD != true). Company not created on remote.'
+        : `Company "${result.name}" registered. company_id is cached in-memory for this process.`
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';

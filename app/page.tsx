@@ -55,6 +55,8 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [lastCompanyId, setLastCompanyId] = useState('');
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -147,7 +149,22 @@ export default function HomePage() {
       const response = await fetch('/api/dashboard/register', { method: 'POST' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Dashboard registration failed');
-      alert(`Company created: ${data.company_id}\nCopy it into DASHBOARD_COMPANY_ID in .env.local.`);
+      if (data.company_id) setLastCompanyId(data.company_id);
+      alert(`Company "${data.name}" registered!\nID: ${data.company_id}\n(auto-saved to .env.local)`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    }
+  }
+
+  async function deleteCompany(companyId: string) {
+    setError('');
+    try {
+      const response = await fetch(`/api/dashboard/delete?company_id=${encodeURIComponent(companyId)}`, { method: 'DELETE' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Delete failed');
+      alert(`Company ${data.company_id} deleted.`);
+      if (lastCompanyId === companyId) setLastCompanyId('');
+      setDeleteModalOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     }
@@ -170,8 +187,8 @@ export default function HomePage() {
               <Link href="/runs" className="rounded-2xl border border-slate-200 px-5 py-3 font-semibold hover:bg-slate-50">
                 View Runs
               </Link>
-              <button onClick={registerDashboard} className="rounded-2xl border border-slate-200 px-5 py-3 font-semibold hover:bg-slate-50">
-                Register Dashboard Company
+              <button onClick={() => setDeleteModalOpen(true)} className="rounded-2xl border border-red-200 px-5 py-3 font-semibold text-red-600 hover:bg-red-50">
+                Delete Company
               </button>
             </div>
           </div>
@@ -211,6 +228,14 @@ export default function HomePage() {
         {result && <RunResultView result={result} />}
         {!progressModalOpen && liveStatus && !result && <ProgressDock status={liveStatus} onOpen={() => setProgressModalOpen(true)} />}
         {result && <CompletionDock result={result} onOpenProgress={() => setProgressModalOpen(true)} />}
+
+        {deleteModalOpen && (
+          <DeleteCompanyModal
+            defaultCompanyId={lastCompanyId}
+            onDelete={deleteCompany}
+            onClose={() => setDeleteModalOpen(false)}
+          />
+        )}
       </div>
     </main>
   );
@@ -227,6 +252,45 @@ function Editor(props: { title: string; value: string; onChange: (value: string)
         onChange={(event) => props.onChange(event.target.value)}
       />
     </label>
+  );
+}
+
+function DeleteCompanyModal({ defaultCompanyId, onDelete, onClose }: { defaultCompanyId: string; onDelete: (id: string) => void; onClose: () => void }) {
+  const [companyId, setCompanyId] = useState(defaultCompanyId);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl">
+        <h2 className="text-lg font-bold text-slate-900">Delete Dashboard Company</h2>
+        <p className="mt-2 text-sm text-slate-600">
+          Enter the company ID to delete from the contest dashboard. This action is irreversible.
+        </p>
+        <input
+          type="text"
+          value={companyId}
+          onChange={(e) => setCompanyId(e.target.value)}
+          placeholder="Company UUID..."
+          className="mt-4 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 font-mono text-sm focus:border-red-300 focus:outline-none focus:ring-2 focus:ring-red-100"
+        />
+        {defaultCompanyId && (
+          <p className="mt-2 text-xs text-slate-500">
+            Pre-filled from last registered company.
+          </p>
+        )}
+        <div className="mt-6 flex justify-end gap-3">
+          <button onClick={onClose} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50">
+            Cancel
+          </button>
+          <button
+            onClick={() => companyId.trim() && onDelete(companyId.trim())}
+            disabled={!companyId.trim()}
+            className="rounded-xl bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-40"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
