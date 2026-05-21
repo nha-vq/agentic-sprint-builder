@@ -197,6 +197,11 @@ function firstAreaOrUnknown(text: string): RepairScopeKind {
   return Array.from(repairAreas(text))[0] ?? 'unknown';
 }
 
+function singleAreaOrUnknown(text: string): RepairScopeKind {
+  const areas = Array.from(repairAreas(text));
+  return areas.length === 1 ? areas[0] : 'unknown';
+}
+
 function scopeLabel(kind: RepairScopeKind, prefix: string) {
   const labels: Record<RepairScopeKind, string> = {
     initial: `${prefix} initial repair`,
@@ -253,6 +258,18 @@ export function inferQaRepairScope(qaFeedback: string, files: GeneratedFile[]): 
     label: scopeLabel(kind, 'QA'),
     instructions: scopeInstructions(kind),
     text: qaFeedback,
+    files,
+    requiresPlanning: true
+  });
+}
+
+export function inferReviewRepairScope(reviewFeedback: string, files: GeneratedFile[]): RepairScope {
+  const kind = singleAreaOrUnknown(reviewFeedback);
+  return createScope({
+    kind,
+    label: scopeLabel(kind, 'CodeReview/Deploy'),
+    instructions: scopeInstructions(kind),
+    text: reviewFeedback,
     files,
     requiresPlanning: true
   });

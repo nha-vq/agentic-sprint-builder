@@ -9,7 +9,7 @@ import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { listRunResults, readGeneratedCodeSnapshot, saveRunResult, writeGeneratedFiles } from '@/lib/storage/file-writer';
 import { validateGeneratedProject, type GeneratedProjectValidation } from '@/lib/validation/generated-project';
 import { prewarmGeneratedComposeRuntime, validateGeneratedProjectExecution } from '@/lib/validation/generated-execution';
-import { formatRepairScope, inferQaRepairScope, inferStaticRepairScope } from '@/lib/validation/repair-scope';
+import { formatRepairScope, inferQaRepairScope, inferReviewRepairScope, inferStaticRepairScope } from '@/lib/validation/repair-scope';
 import { validateBaOutputStructure, validatePreparedTechStackStructure } from '@/lib/validation/agent-lifecycle';
 import { DEFAULT_PROJECT_ID, loadProjectDevSkill, writeProjectDevSkill, writePreDevProjectSkill, type ProjectDevSkill } from '@/lib/skills/project-dev-skill';
 import { enrichSkillContext } from '@/lib/skills/skill-enrichment';
@@ -179,6 +179,83 @@ async function reportRepairScope(progress: RunProgressReporter | undefined, scop
     level: 'info',
     message: `Scoped repair: ${scope.label}. Candidates: ${scope.candidatePaths.join(', ') || 'none detected'}. Directories: ${scope.allowedDirectories.join(', ')}`
   });
+}
+
+type ReviewRepairFinding = {
+  category: string;
+  file: string;
+  finding: string;
+  fix?: string;
+};
+
+function formatReviewRepairFindings(title: string, findings: ReviewRepairFinding[]) {
+  if (findings.length === 0) return `${title}\n- None.`;
+
+  return [
+    title,
+    ...findings.map((finding, index) => {
+      const fix = finding.fix ? `\n  Fix: ${finding.fix}` : '';
+      return `${index + 1}. [${finding.category}] ${finding.file}\n  Finding: ${finding.finding}${fix}`;
+    })
+  ].join('\n');
+}
+
+function formatCodeReviewDeployRepairFeedback(params: {
+  codeReview: CodeReviewOutput;
+  deployValidation: DeployOutput;
+  generatedFiles: GeneratedFile[];
+}) {
+  const deployServices = params.deployValidation.services.length
+    ? params.deployValidation.services.map((service) => `- ${service.name}: ${service.status}, port ${service.port}, health ${service.healthUrl}`).join('\n')
+    : '- None reported.';
+
+  return [
+    'CODE REVIEW / DEPLOY REPAIR PACKET',
+    'Use this packet as the exact bug log for the repair. Fix blocking findings first. Apply advisory findings only when they touch the same files or are clearly required for deploy/readiness. Preserve unrelated files and avoid regenerating the whole project.',
+    '',
+    `Code review status: ${params.codeReview.status}`,
+    `Code review summary: ${params.codeReview.summary}`,
+    `Requirement coverage: ${params.codeReview.requirementCoverage}`,
+    formatReviewRepairFindings('Code review blocking findings:', params.codeReview.blocking),
+    formatReviewRepairFindings('Code review advisory findings:', params.codeReview.advisory),
+    `Deploy validation status: ${params.deployValidation.status}`,
+    `Deploy validation summary: ${params.deployValidation.summary}`,
+    `Deploy command: ${params.deployValidation.deployCommand}`,
+    'Deploy services:',
+    deployServices,
+    formatReviewRepairFindings('Deploy blocking findings:', params.deployValidation.blocking),
+    formatReviewRepairFindings('Deploy advisory findings:', params.deployValidation.advisory),
+    'Generated project overview at repair time:',
+    formatGeneratedProjectOverview(params.generatedFiles)
+  ].join('\n\n');
+}
+
+function formatCodeReviewDeployScopeText(params: {
+  codeReview: CodeReviewOutput;
+  deployValidation: DeployOutput;
+}) {
+  const findings: Array<ReviewRepairFinding & { source: string }> = [
+    ...params.codeReview.blocking.map((finding) => ({ source: 'CodeReview', ...finding })),
+    ...params.deployValidation.blocking.map((finding) => ({ source: 'Deploy', ...finding })),
+    ...params.codeReview.advisory.map((finding) => ({ source: 'CodeReview advisory', ...finding })),
+    ...params.deployValidation.advisory.map((finding) => ({ source: 'Deploy advisory', ...finding }))
+  ];
+
+  if (findings.length === 0) {
+    return [
+      `Code review status: ${params.codeReview.status}`,
+      params.codeReview.summary,
+      `Deploy validation status: ${params.deployValidation.status}`,
+      params.deployValidation.summary
+    ].join('\n');
+  }
+
+  return findings
+    .map((finding) => {
+      const fix = finding.fix ? `\nFix: ${finding.fix}` : '';
+      return `[${finding.source}/${finding.category}] ${finding.file}\nFinding: ${finding.finding}${fix}`;
+    })
+    .join('\n\n');
 }
 
 function summarizeStaticFindings(validation: GeneratedProjectValidation) {
@@ -498,14 +575,22 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   }
 
   if (codeReview.status === 'NEEDS_FIX' || deployValidation.status === 'NEEDS_FIX') {
-    const reviewFeedback = [
-      ...(codeReview.blocking.map((b) => `[CodeReview/${b.category}] ${b.file}: ${b.finding}. Fix: ${b.fix}`)),
-      ...(deployValidation.blocking.map((b) => `[Deploy/${b.category}] ${b.file}: ${b.finding}. Fix: ${b.fix}`))
-    ].join('\n');
-
     await progress({ stepId: 'dev', stepStatus: 'RUNNING', message: 'DEV agent fixing CodeReview/Deploy findings.' });
     await emit({ agentId: 'dev', eventType: 'CODING', task: 'Fix CodeReview and Deploy findings', artifact: 'generated-files' });
     existingFiles = await readGeneratedCodeSnapshot();
+    const reviewFeedback = formatCodeReviewDeployRepairFeedback({
+      codeReview,
+      deployValidation,
+      generatedFiles: existingFiles
+    });
+    const repairScope = inferReviewRepairScope(formatCodeReviewDeployScopeText({ codeReview, deployValidation }), existingFiles);
+    await reportRepairScope(options?.onProgress, repairScope);
+    await progress({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      level: 'info',
+      message: `Prepared CodeReview/Deploy repair packet with findings and generated project overview (${reviewFeedback.length} chars).`
+    });
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
@@ -516,6 +601,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       recentRuns,
       previousDevOutput: devOutput,
       qaFeedback: reviewFeedback,
+      repairScope,
       apiSpec: input.apiSpec,
       projectDevSkill,
       enrichedSkillContext: enrichedSkill.combined,
