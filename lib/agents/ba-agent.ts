@@ -14,7 +14,7 @@ export async function runBAAgent(input: {
   const existingCodeContext = formatGeneratedCodeContext(input.existingFiles ?? []);
   const runHistoryContext = formatRunHistoryContext(input.recentRuns ?? []);
   const imageContext = input.requirementImages?.length
-    ? `\nATTACHED IMAGES: ${input.requirementImages.length} requirement image(s) attached. Analyze them as UI mockups/wireframes/screenshots to understand the visual design, layout, components, and user flow requirements.`
+    ? `\nATTACHED IMAGES: ${input.requirementImages.length} requirement image(s) attached. Analyze them as UI mockups/wireframes/screenshots. Produce a concrete "Frontend Visual Design Contract" section with page-to-image mapping, visual scope boundaries, layout/composition, typography, color/surface tokens, components/states, media treatment, responsive behavior, and DEV implementation notes. Separate visual fidelity from functional scope so out-of-scope mockup features can be static/disabled instead of implemented as full workflows.`
     : '';
 
   return runMarkdownSkillAgent({

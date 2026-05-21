@@ -61,6 +61,10 @@ function allowDockerValidation() {
   return process.env.ALLOW_GENERATED_DOCKER !== 'false';
 }
 
+function shouldFallbackToLocalValidationWhenComposeSkipped() {
+  return process.env.FALLBACK_LOCAL_VALIDATION_WHEN_COMPOSE_SKIPPED !== 'false';
+}
+
 function shouldCleanupGeneratedCompose() {
   return process.env.CLEAN_GENERATED_COMPOSE !== 'false';
 }
@@ -78,13 +82,33 @@ function shouldAutoStartRancherDesktop() {
 }
 
 function getRancherStartTimeoutMs() {
-  const parsed = Number.parseInt(process.env.RANCHER_START_TIMEOUT_MS || '300000', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 300_000;
+  const parsed = Number.parseInt(process.env.RANCHER_START_TIMEOUT_MS || '600000', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 600_000;
 }
 
 function getRancherPollMs() {
   const parsed = Number.parseInt(process.env.RANCHER_READY_POLL_MS || '3000', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 3_000;
+}
+
+function getRancherStartContainerEngine() {
+  const raw = process.env.RANCHER_START_CONTAINER_ENGINE?.trim().toLowerCase();
+  if (raw === 'docker' || raw === 'containerd' || raw === 'moby') return raw;
+  return 'moby';
+}
+
+function getRancherStartKubernetesFlag() {
+  const raw = process.env.RANCHER_START_KUBERNETES?.trim().toLowerCase();
+  if (!raw) return ['--kubernetes.enabled=false'];
+  if (['true', '1', 'yes', 'on'].includes(raw)) return ['--kubernetes.enabled=true'];
+  if (['false', '0', 'no', 'off'].includes(raw)) return ['--kubernetes.enabled=false'];
+  return [];
+}
+
+function getRancherBackgroundStartFlag() {
+  const raw = process.env.RANCHER_START_IN_BACKGROUND?.trim().toLowerCase();
+  if (raw && ['false', '0', 'no', 'off'].includes(raw)) return [];
+  return ['--application.start-in-background'];
 }
 
 function getPreferredComposeEngine() {
@@ -132,6 +156,24 @@ async function getRancherDesktopLaunchCommand() {
   const configuredPath = process.env.RANCHER_DESKTOP_PATH?.trim();
 
   if (process.platform === 'win32') {
+    const configuredRdctlPath = process.env.RANCHER_RDCTL_PATH?.trim();
+    const rdctl = await firstExistingPath([
+      configuredRdctlPath || '',
+      process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Rancher Desktop', 'resources', 'resources', 'win32', 'bin', 'rdctl.exe') : '',
+      process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'] || '', 'Rancher Desktop', 'resources', 'resources', 'win32', 'bin', 'rdctl.exe') : ''
+    ]);
+
+    if (rdctl) {
+      const args = [
+        'start',
+        '--no-modal-dialogs',
+        ...getRancherBackgroundStartFlag(),
+        `--container-engine.name=${getRancherStartContainerEngine()}`,
+        ...getRancherStartKubernetesFlag()
+      ];
+      return { command: rdctl, args, display: `${rdctl} ${args.join(' ')}` };
+    }
+
     const executable = await firstExistingPath([
       configuredPath || '',
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Rancher Desktop', 'Rancher Desktop.exe') : '',
@@ -169,6 +211,40 @@ function launchDetached(command: string, args: string[]) {
       resolve();
     });
   });
+}
+
+export async function prewarmGeneratedComposeRuntime(onProgress?: RunProgressReporter, signal?: AbortSignal) {
+  if (!shouldValidateExecution() || !allowDockerValidation() || !shouldAutoStartRancherDesktop()) return;
+
+  await onProgress?.({
+    stepId: 'execution-validation',
+    stepStatus: 'PENDING',
+    level: 'info',
+    message: 'Prewarming Rancher/Docker in the background while AI agents run. First startup can take about 5 minutes.'
+  });
+
+  const probe = await probeAnyComposeEngineReady(getComposeEnginesToTry(), process.cwd(), signal);
+  if (signal?.aborted) throw new Error('Run canceled by user.');
+
+  if (probe.ok) {
+    await onProgress?.({
+      stepId: 'execution-validation',
+      stepStatus: 'PENDING',
+      level: 'success',
+      message: `Rancher/Docker already ready before deploy validation: ${probe.message}`
+    });
+    return;
+  }
+
+  const launchCommand = await getRancherDesktopLaunchCommand();
+  await onProgress?.({
+    stepId: 'execution-validation',
+    stepStatus: 'PENDING',
+    level: 'warn',
+    message: `Rancher/Docker is not ready yet. Starting Rancher early: ${launchCommand.display}. Estimated startup can take about 5 minutes.`
+  });
+
+  await launchDetached(launchCommand.command, launchCommand.args);
 }
 
 function shouldSkipWorkspaceEntry(entryName: string) {
@@ -400,7 +476,7 @@ async function ensureComposeRuntimeReady(engines: ComposeEngine[], codeDir: stri
       stepId: 'execution-validation',
       stepStatus: 'RUNNING',
       level: 'success',
-      message: initialProbe.message
+      message: `Rancher/Docker ready: ${initialProbe.message}`
     });
 
     return {
@@ -948,6 +1024,19 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
   return steps;
 }
 
+function shouldRunLocalValidationAfterCompose(composeSteps: GeneratedValidationStep[]) {
+  if (!shouldFallbackToLocalValidationWhenComposeSkipped()) return false;
+  if (composeSteps.some((step) => step.status === 'FAIL')) return false;
+
+  return composeSteps.some((step) => {
+    if (step.status !== 'SKIPPED') return false;
+    const target = `${step.name}\n${step.message}`;
+    return /allow_generated_docker=false|environment\/runtime issue|rancher\/docker|docker\/rancher|compose engine|local compose engine|docker compose execution was skipped|not ready|unavailable|not available/i.test(
+      target
+    );
+  });
+}
+
 async function validateLocalNode(codeDir: string, logDir: string, onProgress?: RunProgressReporter, signal?: AbortSignal): Promise<GeneratedValidationStep[]> {
   const frontendDir = await findNearestManifestDir(codeDir, ['package.json']);
   if (!frontendDir) return [skippedStep('frontend local validation', 'No generated frontend package manifest was found.')];
@@ -1067,7 +1156,20 @@ export async function validateGeneratedProjectExecution(onProgress?: RunProgress
       stepStatus: 'RUNNING',
       message: `Compose file detected: ${composeFile}.`
     });
-    steps.push(...(await validateWithDockerCompose(codeDir, composeFile, logDir, onProgress, signal)));
+    const composeSteps = await validateWithDockerCompose(codeDir, composeFile, logDir, onProgress, signal);
+    steps.push(...composeSteps);
+
+    if (shouldRunLocalValidationAfterCompose(composeSteps)) {
+      await onProgress?.({
+        stepId: 'execution-validation',
+        stepStatus: 'RUNNING',
+        level: 'warn',
+        message: 'Compose validation was skipped because Docker/Rancher is unavailable. Running local Node/Python validation instead.'
+      });
+      steps.push(...(await validateLocalNode(codeDir, logDir, onProgress, signal)));
+      steps.push(...(await validateLocalPython(codeDir, logDir, onProgress, signal)));
+    }
+
     return addRepairScope(buildResult({ startedAt, workspace: codeDir, steps }));
   }
 

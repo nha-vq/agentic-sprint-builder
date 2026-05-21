@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { runMarkdownSkillAgent } from './base-agent';
 import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { extractJsonObject } from '@/lib/utils/json';
-import type { DevOutput, GeneratedFile, PreparedTechStackOutput } from '@/lib/types';
+import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RequirementImage } from '@/lib/types';
 
 const CodeReviewFindingSchema = z.object({
   category: z.string(),
@@ -64,8 +64,17 @@ function truncate(value: string, maxChars: number) {
   return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
 }
 
+function formatRequirementImageContext(images?: RequirementImage[] | null) {
+  if (!images?.length) return 'No requirement images are attached.';
+  return [
+    `${images.length} requirement image(s) are attached as visual source material.`,
+    ...images.map((image, index) => `- Image ${index + 1}: ${image.name} (${image.mimeType}, ${Math.round(image.sizeBytes / 1024)} KB)`)
+  ].join('\n');
+}
+
 export async function runCodeReviewAgent(input: {
   requirements: string;
+  requirementImages?: RequirementImage[] | null;
   baOutput: string;
   devOutput: DevOutput;
   preparedTechStack?: PreparedTechStackOutput;
@@ -82,6 +91,7 @@ export async function runCodeReviewAgent(input: {
     fallbackTemperature: 0.2,
     maxTokens: 16_384,
     signal: input.signal,
+    images: input.requirementImages?.length ? input.requirementImages : undefined,
     jsonSchema: {
       name: 'code_review_output',
       schema: CodeReviewJsonSchema
@@ -91,6 +101,9 @@ Review the generated code against the requirements, BA output, and prepared tech
 
 REQUIREMENTS:
 ${truncate(input.requirements, 4_000)}
+
+REQUIREMENT IMAGE CONTEXT:
+${formatRequirementImageContext(input.requirementImages)}
 
 BA OUTPUT:
 ${truncate(input.baOutput, 6_000)}
@@ -107,7 +120,8 @@ ${truncate(input.devOutput.architecture, 2_000)}
 GENERATED FILES:
 ${truncate(fileList, 60_000)}
 
-Review for: architecture consistency, requirement coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, and security basics.
+Review for: architecture consistency, requirement coverage, visual design contract coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, and security basics.
+If requirement images are attached, use them only for source-level visual coverage review. Do not require screenshot or pixel-diff evidence, but flag obvious missing mockup-driven layout/style/component requirements from frontend files as requirement blockers.
 Return JSON only.
 `
   });

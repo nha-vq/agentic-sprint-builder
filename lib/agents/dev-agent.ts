@@ -5,7 +5,7 @@ import { RUN_LIMITS } from '@/lib/config/limits';
 import { extractJsonObject } from '@/lib/utils/json';
 import { formatRepairScope } from '@/lib/validation/repair-scope';
 import type { ProjectDevSkill } from '@/lib/skills/project-dev-skill';
-import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RepairScope, RunProgressReporter, RunResult } from '@/lib/types';
+import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RepairScope, RequirementImage, RunProgressReporter, RunResult } from '@/lib/types';
 
 const GeneratedFileSchema = z.object({
   path: z.string().min(1).max(240),
@@ -119,6 +119,40 @@ const GeneratedFileBatchJsonSchema = {
 function truncate(value: string, maxChars: number) {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+}
+
+function formatRequirementImageContext(images?: RequirementImage[] | null) {
+  if (!images?.length) {
+    return 'No requirement images are attached.';
+  }
+
+  const imageList = images
+    .map((image, index) => `- Image ${index + 1}: ${image.name} (${image.mimeType}, ${Math.round(image.sizeBytes / 1024)} KB)`)
+    .join('\n');
+
+  return `Attached requirement images are available to this DEV request as visual source material.
+${imageList}
+
+Use these images together with the BA Frontend Visual Design Contract. For frontend visual files, inspect the attached images directly before deciding layout, styling, component composition, product imagery treatment, spacing, typography, and responsive behavior. Reproduce visible in-scope UI and static placeholders needed for visual fidelity, but do not add backend workflows for out-of-scope mockup features.`;
+}
+
+function hasRequirementImages(images?: RequirementImage[] | null) {
+  return (images?.length ?? 0) > 0;
+}
+
+function isFrontendVisualPath(filePath: string) {
+  const normalized = normalizeGeneratedPath(filePath);
+  return (
+    normalized.startsWith('frontend/') &&
+    (/\.(tsx|jsx|ts|js|css|scss|sass|html)$/.test(normalized) ||
+      /(^|\/)(tailwind|postcss|next|vite)\.config\.(js|ts|mjs|cjs)$/.test(normalized) ||
+      /(^|\/)(package\.json|tsconfig\.json|jsconfig\.json)$/.test(normalized))
+  );
+}
+
+function imagesForFrontendTargets(images: RequirementImage[] | undefined, manifestFiles: DevManifest['files']) {
+  if (!images?.length) return undefined;
+  return manifestFiles.some((file) => isFrontendVisualPath(file.path)) ? images : undefined;
 }
 
 function isTruncationError(error: unknown) {
@@ -316,6 +350,7 @@ function buildScopedRepairManifest(params: {
 function buildDevContext(input: {
   requirements: string;
   techSpec: string;
+  requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingCode: string;
@@ -346,6 +381,9 @@ ${input.requirements}
 
 TECH SPEC:
 ${input.techSpec}
+
+REQUIREMENT IMAGE CONTEXT:
+${formatRequirementImageContext(input.requirementImages)}
 
 PREPARED TECH STACK (SOURCE OF TRUTH WHEN PRESENT):
 ${input.preparedTechStack ? JSON.stringify(input.preparedTechStack, null, 2) : 'Not prepared. If this is first generation, report this as a workflow issue and use safe skill defaults only when instructed by the orchestrator.'}
@@ -383,6 +421,7 @@ ${input.apiSpec || 'Not provided'}
 
 async function requestDevManifest(params: {
   devContext: string;
+  requirementImages?: RequirementImage[];
   projectDevSkill?: ProjectDevSkill | null;
   preparedTechStack?: PreparedTechStackOutput;
   enrichedSkillContext?: string;
@@ -408,6 +447,7 @@ async function requestDevManifest(params: {
           schema: DevManifestJsonSchema
         },
         signal: params.signal,
+        images: hasRequirementImages(params.requirementImages) ? params.requirementImages : undefined,
         userPrompt: `
 Plan the implementation. Return JSON only.
 
@@ -417,6 +457,7 @@ Keep setupInstructions concise. Avoid markdown lists inside JSON strings.
 Do not plan package lockfiles, vendored dependencies, build outputs, binary/base64 assets, screenshots, huge fixtures, or massive seed datasets unless explicitly required.
 Plan all files required by the loaded DEV skill, BA output, requirements, tech spec, and any repair scope.
 The file list must be complete enough for the generated project to satisfy the loaded skill and local validation.
+If requirement images are attached, include the frontend page, component, style/theme, layout, and seed-media files needed to implement the BA Frontend Visual Design Contract rather than a generic scaffold.
 ${attempt > 1 ? 'Previous manifest response failed or was truncated. Return shorter valid JSON only.' : ''}
 ${params.repairScope ? 'This is a scoped incremental repair. Use QA OR BUILD FEEDBACK, GENERATED PROJECT OVERVIEW, and SCOPED REPAIR CONSTRAINTS to select the smallest useful file set allowed by the loaded DEV skill.' : ''}
 
@@ -442,6 +483,7 @@ ${params.devContext}
 function buildBatchFileContext(input: {
   requirements: string;
   techSpec: string;
+  requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   qaFeedback: string;
@@ -487,6 +529,9 @@ ${truncate(input.requirements, 4_000)}
 
 TECH SPEC EXCERPT:
 ${truncate(input.techSpec, 3_000)}
+
+REQUIREMENT IMAGE CONTEXT:
+${formatRequirementImageContext(input.requirementImages)}
 
 PREPARED TECH STACK EXCERPT:
 ${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), 6_000) : 'Not prepared.'}
@@ -541,6 +586,7 @@ async function requestGeneratedFile(params: {
   input: {
     requirements: string;
     techSpec: string;
+    requirementImages?: RequirementImage[];
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -554,9 +600,11 @@ async function requestGeneratedFile(params: {
   manifest: DevManifest;
   manifestFile: DevManifest['files'][number];
 }): Promise<GeneratedFile> {
+  const attachedImages = isFrontendVisualPath(params.manifestFile.path) && hasRequirementImages(params.input.requirementImages) ? params.input.requirementImages : undefined;
   const batchContext = buildBatchFileContext({
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
+    requirementImages: attachedImages,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -584,6 +632,7 @@ async function requestGeneratedFile(params: {
           schema: GeneratedFileJsonSchema
         },
         signal: params.input.signal,
+        images: attachedImages,
         userPrompt: `
 Generate exactly one complete file. Return JSON only.
 
@@ -599,6 +648,7 @@ Rules:
 - Keep the file concise enough to fit in one response.
 - ${fileSizeLimitInstruction()}
 - Do not include markdown fences or commentary.
+- If requirement images are attached to this request, inspect them directly and implement the visible mockup-driven layout/style details for the target frontend file.
 ${attempt > 1 ? '- Previous response failed, was truncated, or exceeded the file-size limit. Return a smaller complete implementation for this file.' : ''}
 
 ${batchContext}
@@ -636,6 +686,7 @@ ${batchContext}
       enrichedSkillContext: params.input.enrichedSkillContext
     }),
     signal: params.input.signal,
+    images: attachedImages,
     userPrompt: `
 Generate exactly one complete file using raw markers, not JSON.
 
@@ -650,6 +701,7 @@ Rules:
 - Do not add commentary before or after the markers.
 - Keep the file concise enough to fit in one response.
 - ${fileSizeLimitInstruction()}
+- If requirement images are attached to this request, inspect them directly and implement the visible mockup-driven layout/style details for this frontend file.
 
 ${batchContext}
 
@@ -670,6 +722,7 @@ async function requestGeneratedFileBatch(params: {
   input: {
     requirements: string;
     techSpec: string;
+    requirementImages?: RequirementImage[];
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -695,9 +748,11 @@ async function requestGeneratedFileBatch(params: {
   }
 
   const paths = params.manifestFiles.map((file) => file.path);
+  const attachedImages = imagesForFrontendTargets(params.input.requirementImages, params.manifestFiles);
   const batchContext = buildBatchFileContext({
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
+    requirementImages: attachedImages,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -723,6 +778,7 @@ async function requestGeneratedFileBatch(params: {
           schema: GeneratedFileBatchJsonSchema
         },
         signal: params.input.signal,
+        images: attachedImages,
         userPrompt: `
 Generate a batch of complete files. Return JSON only.
 
@@ -739,6 +795,7 @@ Rules:
 - Keep files concise enough to fit in one response.
 - ${fileSizeLimitInstruction()}
 - Do not include markdown fences or commentary.
+- If requirement images are attached to this request, inspect them directly and implement the visible mockup-driven layout/style details for the target frontend files.
 ${attempt > 1 ? '- Previous batch response failed, was truncated, or exceeded the file-size limit. Return shorter complete implementations for the same files.' : ''}
 
 ${batchContext}
@@ -783,6 +840,7 @@ ${batchContext}
 export async function runDevAgent(input: {
   requirements: string;
   techSpec?: string | null;
+  requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingFiles?: GeneratedFile[];
@@ -813,6 +871,15 @@ export async function runDevAgent(input: {
     message: input.projectDevSkill ? `DEV using project-specific skill: ${input.projectDevSkill.path}` : 'DEV using overall dev skill; no project-specific skill exists yet.'
   });
 
+  if (input.requirementImages?.length) {
+    await input.onProgress?.({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      level: 'info',
+      message: `DEV received ${input.requirementImages.length} requirement image(s); visual frontend files will include the images directly.`
+    });
+  }
+
   if (input.repairScope && (input.existingFiles?.length ?? 0) > 0) {
     await input.onProgress?.({
       stepId: 'dev',
@@ -824,6 +891,7 @@ export async function runDevAgent(input: {
   const devContext = buildDevContext({
     requirements: input.requirements,
     techSpec,
+    requirementImages: input.requirementImages,
     preparedTechStack: input.preparedTechStack,
     baOutput: input.baOutput,
     existingCode,
@@ -857,6 +925,7 @@ export async function runDevAgent(input: {
     });
     manifest = await requestDevManifest({
       devContext,
+      requirementImages: input.requirementImages ?? undefined,
       repairScope: input.repairScope,
       onProgress: input.onProgress,
       projectDevSkill: input.projectDevSkill,
@@ -893,6 +962,7 @@ export async function runDevAgent(input: {
       input: {
         requirements: input.requirements,
         techSpec,
+        requirementImages: input.requirementImages ?? undefined,
         preparedTechStack: input.preparedTechStack,
         baOutput: input.baOutput,
         existingFiles: input.existingFiles,

@@ -1,6 +1,6 @@
 ---
 agent_id: qa
-name: Carol QA
+name: Tam QA
 role: qa
 model: google/gemini-2.5-flash
 temperature: 0.2

@@ -33,6 +33,9 @@ Treat the current user requirements and BA output as the acceptance contract. Pr
 ### BA Output Excerpt
 {{BA_OUTPUT_EXCERPT}}
 
+### Frontend Visual Design Contract
+{{VISUAL_CONTRACT_EXCERPT}}
+
 ## Prepared Tech Stack
 This section is produced by the prepare-tech-stack flow and is the source of truth for stack decisions unless later user requirements explicitly change it.
 
@@ -62,6 +65,12 @@ This section is produced by the prepare-tech-stack flow and is the source of tru
 
 ## Component And Source Conventions
 {{CONVENTIONS}}
+
+## Visual Fidelity Rules
+- Preserve the current frontend visual direction captured in the BA Frontend Visual Design Contract unless a later user request explicitly changes it.
+- For future frontend changes, map each visual requirement to concrete pages, components, styling/theme files, and seed media choices before generating files.
+- Visible mockup elements that are outside functional scope may be rendered as static or disabled UI only when they are needed to preserve the visual match; do not add unsupported backend workflows for them.
+- Do not regress the established header, navigation, footer, spacing, typography, color palette, product imagery treatment, responsive behavior, or component states when making focused feature or repair changes.
 
 ## Database Conventions
 {{MIGRATIONS}}

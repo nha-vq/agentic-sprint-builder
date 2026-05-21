@@ -2,47 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { DEFAULT_REQUIREMENTS, DEFAULT_TECH_SPEC } from '@/lib/default-run-inputs';
 import type { RequirementImage, RunResult, RunStatusSnapshot } from '@/lib/types';
-
-const DEFAULT_REQUIREMENTS = `# Simple Shopping Cart App
-
-## Overview
-
-Build a full-stack Watch shopping cart app.
-
-## In Scope
-
-Only implement features defined below.
-
-### Features
-
-Only implement 2 pages:
-
-1. **Home Page** – Product list page.
-2. **Product Detail Page** – View details of a product.
-
-Mockup files are provided for:
-- UI/UX
-- Layout: Header, Footer, Navigation Bar, and Menu
-
-## Out of Scope
-
-- NFRs
-- Implementing all features shown in mockups`;
-
-const DEFAULT_TECH_SPEC = `# Simple Shopping Cart App
-
-## Overview
-
-Build a full-stack the shopping cart app.
-
-### Technical Stack
-
-| Layer    | Technology           |
-|----------|----------------------|
-| Frontend | Next.js + Tailwind CSS |
-| Backend  | FastAPI + SQLModel   |
-| Database | SQLite               |`;
 
 export default function HomePage() {
   const [requirements, setRequirements] = useState(DEFAULT_REQUIREMENTS);
@@ -57,6 +18,7 @@ export default function HomePage() {
   const [error, setError] = useState('');
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [lastCompanyId, setLastCompanyId] = useState('');
+  const [dismissedRancherToastKey, setDismissedRancherToastKey] = useState('');
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -217,6 +179,13 @@ export default function HomePage() {
           {error && <p className="text-sm font-medium text-red-600">{error}</p>}
         </div>
 
+        {liveStatus && (
+          <RancherRuntimeToast
+            status={liveStatus}
+            dismissedKey={dismissedRancherToastKey}
+            onDismiss={setDismissedRancherToastKey}
+          />
+        )}
         {liveStatus && progressModalOpen && (
           <RunProgressModal
             status={liveStatus}
@@ -303,31 +272,56 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function waitForBrowserPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      window.setTimeout(resolve, 0);
+    });
+  });
+}
+
 function RequirementImageInput({ images, onChange }: { images: RequirementImage[]; onChange: (images: RequirementImage[]) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const MAX_IMAGES = 8;
   const MAX_SIZE = 5 * 1024 * 1024;
+  const MIN_UPLOAD_SPINNER_MS = 700;
 
   async function handleFiles(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
     if (inputRef.current) inputRef.current.value = '';
+    if (files.length === 0) return;
 
-    const newImages: RequirementImage[] = [];
-    for (const file of files) {
-      if (images.length + newImages.length >= MAX_IMAGES) break;
-      if (file.size > MAX_SIZE) continue;
-      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) continue;
+    setIsUploading(true);
+    const startedAt = Date.now();
+    try {
+      await waitForBrowserPaint();
 
-      const dataUrl = await readFileAsDataUrl(file);
-      newImages.push({
-        name: file.name,
-        mimeType: file.type as RequirementImage['mimeType'],
-        sizeBytes: file.size,
-        dataUrl
-      });
+      const newImages: RequirementImage[] = [];
+      for (const file of files) {
+        if (images.length + newImages.length >= MAX_IMAGES) break;
+        if (file.size > MAX_SIZE) continue;
+        if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) continue;
+
+        await waitForBrowserPaint();
+        const dataUrl = await readFileAsDataUrl(file);
+        newImages.push({
+          name: file.name,
+          mimeType: file.type as RequirementImage['mimeType'],
+          sizeBytes: file.size,
+          dataUrl
+        });
+        await waitForBrowserPaint();
+      }
+
+      if (newImages.length > 0) onChange([...images, ...newImages]);
+    } finally {
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs < MIN_UPLOAD_SPINNER_MS) {
+        await new Promise((resolve) => setTimeout(resolve, MIN_UPLOAD_SPINNER_MS - elapsedMs));
+      }
+      setIsUploading(false);
     }
-
-    onChange([...images, ...newImages]);
   }
 
   function removeImage(index: number) {
@@ -344,10 +338,18 @@ function RequirementImageInput({ images, onChange }: { images: RequirementImage[
         <button
           type="button"
           onClick={() => inputRef.current?.click()}
-          disabled={images.length >= MAX_IMAGES}
-          className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-40"
+          disabled={images.length >= MAX_IMAGES || isUploading}
+          aria-label={isUploading ? 'Uploading images' : 'Add images'}
+          className="inline-flex min-w-[124px] items-center justify-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-40"
         >
-          + Add Images
+          {isUploading ? (
+            <span
+              className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600"
+              aria-hidden="true"
+            />
+          ) : (
+            '+ Add Images'
+          )}
         </button>
         <input
           ref={inputRef}
@@ -530,6 +532,66 @@ function CompletionDock({ result, onOpenProgress }: { result: RunResult; onOpenP
       <button onClick={onOpenProgress} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
         Show popup
       </button>
+    </div>
+  );
+}
+
+function compactLogMessage(value: string) {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > 96 ? `${compact.slice(0, 96)}...` : compact;
+}
+
+function RancherRuntimeToast({
+  status,
+  dismissedKey,
+  onDismiss
+}: {
+  status: RunStatusSnapshot;
+  dismissedKey: string;
+  onDismiss: (key: string) => void;
+}) {
+  if (status.status !== 'RUNNING' && status.status !== 'QUEUED') return null;
+
+  const latest = [...status.logs].reverse().find((log) =>
+    /rancher\/docker|rancher desktop|docker_engine|containerd socket|rdctl|compose engine|docker engine|prewarming rancher|cli and engine are ready/i.test(log.message)
+  );
+  if (!latest) return null;
+
+  const toastKey = `${latest.timestamp}-${latest.message}`;
+  if (dismissedKey === toastKey) return null;
+
+  const ready = /already ready|became ready|cli and engine are ready/i.test(latest.message);
+  const active = ready || /prewarming|not ready|starting rancher|launching rancher|waiting for rancher|docker_engine|containerd socket/i.test(latest.message);
+  if (!active) return null;
+
+  return (
+    <div className={`fixed bottom-5 left-5 z-[60] w-[min(320px,calc(100vw-2rem))] rounded-2xl border bg-white p-3 shadow-xl ${ready ? 'border-emerald-200' : 'border-amber-200'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          {ready ? (
+            <span className="mt-1 h-3 w-3 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />
+          ) : (
+            <span className="mt-0.5 block h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-amber-200 border-t-amber-600" aria-hidden="true" />
+          )}
+          <div>
+            <p className="text-sm font-bold text-slate-900">{ready ? 'Rancher/Docker ready' : 'Starting Rancher/Docker'}</p>
+            <p className="mt-0.5 text-xs text-slate-600">
+              {ready ? 'Compose can run now.' : 'Waiting for Docker pipe, about 5 min.'}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => onDismiss(toastKey)}
+          className="-mr-1 -mt-1 inline-flex h-7 w-7 items-center justify-center rounded-full text-sm font-bold text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+          aria-label="Close Rancher/Docker status"
+        >
+          X
+        </button>
+      </div>
+      <p className="mt-2 break-words rounded-lg bg-slate-50 px-2 py-1.5 font-mono text-[10px] leading-3 text-slate-600">
+        {compactLogMessage(latest.message)}
+      </p>
     </div>
   );
 }

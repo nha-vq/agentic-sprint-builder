@@ -1,8 +1,8 @@
 ---
 agent_id: deploy
-name: Duke Deploy
-role: deployer
-model: google/gemini-2.5-flash
+name: Nha Deploy
+role: devops
+model: anthropic/claude-opus-4
 temperature: 0.1
 ---
 # Deploy Agent Skill

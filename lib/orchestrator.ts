@@ -8,7 +8,7 @@ import { runPrepareTechStackAgent } from '@/lib/agents/tech-stack-agent';
 import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { listRunResults, readGeneratedCodeSnapshot, saveRunResult, writeGeneratedFiles } from '@/lib/storage/file-writer';
 import { validateGeneratedProject, type GeneratedProjectValidation } from '@/lib/validation/generated-project';
-import { validateGeneratedProjectExecution } from '@/lib/validation/generated-execution';
+import { prewarmGeneratedComposeRuntime, validateGeneratedProjectExecution } from '@/lib/validation/generated-execution';
 import { formatRepairScope, inferQaRepairScope, inferStaticRepairScope } from '@/lib/validation/repair-scope';
 import { validateBaOutputStructure, validatePreparedTechStackStructure } from '@/lib/validation/agent-lifecycle';
 import { DEFAULT_PROJECT_ID, loadProjectDevSkill, writeProjectDevSkill, writePreDevProjectSkill, type ProjectDevSkill } from '@/lib/skills/project-dev-skill';
@@ -275,6 +275,15 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     });
   }
 
+  void prewarmGeneratedComposeRuntime(progress, options?.signal).catch((error) => {
+    void progress({
+      stepId: 'execution-validation',
+      stepStatus: 'PENDING',
+      level: 'warn',
+      message: `Rancher/Docker prewarm could not start early: ${error instanceof Error ? error.message : String(error)}`
+    }).catch(() => {});
+  });
+
   let existingFiles = await readGeneratedCodeSnapshot();
   const recentRuns = await listRunResults();
   throwIfCanceled(options?.signal);
@@ -415,6 +424,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   let devOutput = await runDevAgent({
     requirements: input.requirements,
     techSpec: input.techSpec,
+    requirementImages: input.requirementImages,
     preparedTechStack,
     baOutput,
     existingFiles,
@@ -441,6 +451,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   try {
     codeReview = await runCodeReviewAgent({
       requirements: input.requirements,
+      requirementImages: input.requirementImages,
       baOutput,
       devOutput,
       preparedTechStack,
@@ -498,6 +509,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -552,6 +564,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -637,6 +650,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -756,6 +770,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
       preparedTechStack,
       baOutput,
       existingFiles,

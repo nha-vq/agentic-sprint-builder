@@ -12,6 +12,7 @@ const REQUIRED_BA_SECTIONS = [
   'Constraints',
   'Selected Technology Stack',
   'Architecture Decisions',
+  'Frontend Visual Design Contract',
   'Database Needs',
   'Authentication Needs',
   'API Architecture',
@@ -26,7 +27,7 @@ const REQUIRED_BA_SECTIONS = [
 
 function hasHeading(markdown: string, heading: string) {
   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|\\n)\\s*#{1,6}\\s+${escaped}\\s*(\\n|$)`, 'i').test(markdown);
+  return new RegExp(`(^|\\n)\\s*(?:#{1,6}\\s+|\\d+\\.\\s*)${escaped}\\s*(\\n|$)`, 'i').test(markdown);
 }
 
 export function validateBaOutputStructure(baOutput: string): AgentLifecycleValidation {

@@ -1,12 +1,12 @@
 import type { AgentEvent, AgentId, DashboardEventType } from '@/lib/types';
 
 const AGENTS = [
-  { agent_id: 'ba', name: 'Alice BA', role: 'analyst' },
-  { agent_id: 'tech-stack', name: 'Taylor Tech Stack', role: 'architect' },
-  { agent_id: 'dev', name: 'Bob DEV', role: 'dev' },
-  { agent_id: 'code-review', name: 'Rex Code Review', role: 'reviewer' },
-  { agent_id: 'deploy', name: 'Duke Deploy', role: 'deployer' },
-  { agent_id: 'qa', name: 'Carol QA', role: 'qa' }
+  { agent_id: 'ba', name: 'Huy BA', role: 'analyst' },
+  { agent_id: 'tech-stack', name: 'Nha Tech Stack', role: 'architect' },
+  { agent_id: 'dev', name: 'Nha & Dong DEV', role: 'dev' },
+  { agent_id: 'code-review', name: 'Dong Code Review', role: 'reviewer' },
+  { agent_id: 'deploy', name: 'Nha Deploy', role: 'devops' },
+  { agent_id: 'qa', name: 'Tam QA', role: 'qa' }
 ];
 
 export interface DashboardClient {

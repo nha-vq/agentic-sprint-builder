@@ -9,6 +9,7 @@ export const DEFAULT_PROJECT_ID = 'generated-code';
 const MAX_SKILL_SECTION_CHARS = 6_000;
 const MAX_BA_EXCERPT_CHARS = 4_000;
 const MAX_REQUIREMENTS_EXCERPT_CHARS = 4_000;
+const MAX_VISUAL_CONTRACT_CHARS = 8_000;
 
 export interface ProjectDevSkill extends LoadedSkill {
   projectId: string;
@@ -35,6 +36,37 @@ export interface ProjectDevSkillValidation {
 function truncate(value: string, maxChars: number) {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractMarkdownSection(markdown: string, heading: string) {
+  const lines = markdown.split(/\r?\n/);
+  const headingPattern = new RegExp(`^\\s*(?:#{1,6}\\s+|\\d+\\.\\s*)${escapeRegExp(heading)}\\s*$`, 'i');
+  const nextSectionPattern = /^\s*(?:#{1,6}\s+|\d+\.\s*)[A-Z][^\n]*$/;
+  const start = lines.findIndex((line) => headingPattern.test(line));
+  if (start < 0) return '';
+
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (nextSectionPattern.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+
+  return lines.slice(start, end).join('\n').trim();
+}
+
+function visualContractExcerpt(baOutput: string) {
+  const section = extractMarkdownSection(baOutput, 'Frontend Visual Design Contract');
+  if (!section) {
+    return 'No dedicated Frontend Visual Design Contract section was found in the latest BA output. If requirement images were attached, future BA output must include this section.';
+  }
+
+  return truncate(section, MAX_VISUAL_CONTRACT_CHARS);
 }
 
 function normalizePath(filePath: string) {
@@ -270,6 +302,7 @@ async function buildProjectDevSkillMarkdown(input: ProjectDevSkillWriteInput) {
     UPDATED_AT: new Date().toISOString(),
     REQUIREMENTS_EXCERPT: truncate(input.requirements || 'Not provided.', MAX_REQUIREMENTS_EXCERPT_CHARS),
     BA_OUTPUT_EXCERPT: truncate(input.baOutput || 'Not provided.', MAX_BA_EXCERPT_CHARS),
+    VISUAL_CONTRACT_EXCERPT: visualContractExcerpt(input.baOutput || ''),
     PREPARED_TECH_STACK: JSON.stringify(input.preparedTechStack ?? null, null, 2),
     FRONTEND_STACK: stack.frontend,
     BACKEND_STACK: stack.backend,
@@ -358,6 +391,7 @@ export async function writePreDevProjectSkill(input: PreDevProjectSkillInput): P
     UPDATED_AT: new Date().toISOString(),
     REQUIREMENTS_EXCERPT: truncate(input.requirements || 'Not provided.', MAX_REQUIREMENTS_EXCERPT_CHARS),
     BA_OUTPUT_EXCERPT: truncate(input.baOutput || 'Not provided.', MAX_BA_EXCERPT_CHARS),
+    VISUAL_CONTRACT_EXCERPT: visualContractExcerpt(input.baOutput || ''),
     PREPARED_TECH_STACK: JSON.stringify(input.preparedTechStack, null, 2),
     FRONTEND_STACK: stack.frontend,
     BACKEND_STACK: stack.backend,

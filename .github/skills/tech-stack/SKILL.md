@@ -1,6 +1,6 @@
 ---
 agent_id: tech-stack
-name: Taylor Tech Stack
+name: Nha Tech Stack
 role: architect
 model: google/gemini-2.5-flash
 temperature: 0.1
