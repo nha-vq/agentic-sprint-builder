@@ -40,6 +40,7 @@ const PreparedTechStackSchema = z.object({
     })
   ),
   projectArchitecture: z.string().min(1),
+  devSkillGuidance: z.string().min(1).optional(),
   assumptions: z.array(z.string()),
   tradeoffs: z.array(z.string())
 });
@@ -58,6 +59,7 @@ const PreparedTechStackJsonSchema = {
     'servicePorts',
     'environmentVariables',
     'projectArchitecture',
+    'devSkillGuidance',
     'assumptions',
     'tradeoffs'
   ],
@@ -111,6 +113,7 @@ const PreparedTechStackJsonSchema = {
       }
     },
     projectArchitecture: { type: 'string' },
+    devSkillGuidance: { type: 'string' },
     assumptions: {
       type: 'array',
       items: { type: 'string' }
@@ -136,6 +139,7 @@ export async function runPrepareTechStackAgent(input: {
   baOutput: string;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
+  modelOverride?: string;
   signal?: AbortSignal;
 }): Promise<PreparedTechStackOutput> {
   const techSpec = input.techSpec?.trim() || 'Not provided';
@@ -143,6 +147,7 @@ export async function runPrepareTechStackAgent(input: {
 
   const raw = await runMarkdownSkillAgent({
     agentId: 'tech-stack',
+    modelOverride: input.modelOverride,
     fallbackTemperature: 0.1,
     maxTokens: 8_192,
     jsonSchema: {

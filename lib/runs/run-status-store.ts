@@ -5,7 +5,10 @@ const MAX_LOGS = 500;
 const DEFAULT_STEPS: RunProgressStep[] = [
   { id: 'ba', label: 'BA analysis', status: 'PENDING' },
   { id: 'tech-stack', label: 'Tech stack prep', status: 'PENDING' },
-  { id: 'dev', label: 'DEV generation', status: 'PENDING' },
+  { id: 'dev', label: 'DEV lead', status: 'PENDING' },
+  { id: 'frontend-dev', label: 'Frontend DEV', status: 'PENDING' },
+  { id: 'backend-dev', label: 'Backend DEV', status: 'PENDING' },
+  { id: 'integration-dev', label: 'Integration DEV', status: 'PENDING' },
   { id: 'code-review', label: 'Code review', status: 'PENDING' },
   { id: 'deploy-validation', label: 'Deploy validation', status: 'PENDING' },
   { id: 'static-validation', label: 'Static readiness', status: 'PENDING' },

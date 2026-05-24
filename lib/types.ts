@@ -1,4 +1,15 @@
-export type AgentId = 'ba' | 'tech-stack' | 'dev' | 'code-review' | 'deploy' | 'qa';
+export type AgentId =
+  | 'ba'
+  | 'tech-stack'
+  | 'dev'
+  | 'frontend-dev'
+  | 'backend-dev'
+  | 'integration-dev'
+  | 'code-review'
+  | 'deploy'
+  | 'qa';
+
+export type AgentModelMap = Partial<Record<AgentId, string>>;
 
 export type DashboardEventType =
   | 'THINKING'
@@ -18,6 +29,8 @@ export interface AgentEvent {
   task: string;
   toAgent?: AgentId;
   timestamp: string;
+  dashboardAgentId?: string;
+  dashboardToAgentId?: string;
   dashboardAccepted?: boolean;
 }
 
@@ -30,6 +43,17 @@ export interface RequirementImage {
 
 export type RequirementImageMetadata = Omit<RequirementImage, 'dataUrl'>;
 
+export interface FreeImageCandidate {
+  title: string;
+  pageUrl: string;
+  imageUrl: string;
+  thumbUrl?: string;
+  license: string;
+  licenseUrl?: string;
+  source: 'Wikimedia Commons';
+  query: string;
+}
+
 export interface RunRequest {
   requirements: string;
   techSpec?: string | null;
@@ -37,6 +61,7 @@ export interface RunRequest {
   topic?: string;
   projectId?: string;
   requirementImages?: RequirementImage[] | null;
+  agentModels?: AgentModelMap | null;
 }
 
 export type RunJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELED';
@@ -64,6 +89,36 @@ export interface RunProgressUpdate {
 }
 
 export type RunProgressReporter = (update: RunProgressUpdate) => void | Promise<void>;
+
+export interface LlmUsageRecord {
+  agentId: AgentId;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  createdAt: string;
+  responseId?: string;
+}
+
+export interface LlmCostBreakdown {
+  id: string;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface RunCostSummary {
+  totalUsd: number;
+  totalCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  byAgent: LlmCostBreakdown[];
+  byModel: LlmCostBreakdown[];
+}
 
 export interface RunStatusSnapshot {
   runId: string;
@@ -115,6 +170,7 @@ export interface PreparedTechStackOutput {
     required: boolean;
   }>;
   projectArchitecture: string;
+  devSkillGuidance?: string;
   assumptions: string[];
   tradeoffs: string[];
 }
@@ -191,8 +247,10 @@ export interface RunResult {
   devOutput: DevOutput;
   codeReviewStatus?: 'PASS' | 'NEEDS_FIX';
   codeReviewSummary?: string;
+  codeReviewFixIterations?: number;
   deployValidationStatus?: 'PASS' | 'NEEDS_FIX';
   deployValidationSummary?: string;
+  deployFixIterations?: number;
   qaOutput: string;
   qaStatus?: QAStatus;
   qaFindings?: string[];
@@ -201,6 +259,10 @@ export interface RunResult {
   executionValidationFixIterations?: number;
   executionValidation?: GeneratedExecutionValidationResult;
   runtime?: GeneratedRuntimeResult;
+  freeImageCandidates?: FreeImageCandidate[];
+  agentModels?: AgentModelMap;
+  llmUsage?: LlmUsageRecord[];
+  costSummary?: RunCostSummary;
   events: AgentEvent[];
   outputDir: string;
   codeOutputDir: string;

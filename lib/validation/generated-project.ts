@@ -159,6 +159,49 @@ function findRelativeImportIssues(output: DevOutput) {
   return issues;
 }
 
+function hasUseClientDirective(content: string) {
+  return /^\s*['"]use client['"]\s*;?/u.test(content);
+}
+
+function findNextAppRuntimeIssues(output: DevOutput) {
+  const issues: string[] = [];
+  const sourceFiles = output.files.filter((file) => /\.(tsx|jsx)$/i.test(file.path));
+
+  for (const file of sourceFiles) {
+    const normalizedPath = normalizePath(file.path);
+    if (!/(^|\/)(app|components)\//u.test(normalizedPath)) continue;
+
+    if (/from\s+['"]react-icons\//u.test(file.content) && !hasUseClientDirective(file.content)) {
+      issues.push(
+        `App Router component ${file.path} imports react-icons but is not marked with 'use client'; add the directive or replace the icons with server-safe markup to avoid prerender useContext failures.`
+      );
+    }
+  }
+
+  return issues;
+}
+
+function findDockerfileRuntimeIssues(output: DevOutput) {
+  const issues: string[] = [];
+  const dockerfiles = output.files.filter((file) => fileName(file.path) === 'dockerfile');
+
+  for (const file of dockerfiles) {
+    if (!/COPY\s+--from=builder\s+\/app\/public\s+\.\/public/iu.test(file.content)) continue;
+
+    const dockerDir = dirName(file.path);
+    const publicPrefix = dockerDir === '.' ? 'public/' : `${dockerDir}/public/`;
+    const hasPublicFiles = output.files.some((candidate) => normalizePath(candidate.path).startsWith(publicPrefix));
+
+    if (!hasPublicFiles) {
+      issues.push(
+        `Dockerfile ${file.path} copies /app/public from the build stage, but no generated ${publicPrefix} files exist; remove that COPY step or generate a public asset folder.`
+      );
+    }
+  }
+
+  return issues;
+}
+
 export function validateGeneratedProject(output: DevOutput): GeneratedProjectValidation {
   const findings: string[] = [];
   let contract: SkillValidationContract;
@@ -209,6 +252,8 @@ export function validateGeneratedProject(output: DevOutput): GeneratedProjectVal
   }
 
   findings.push(...findRelativeImportIssues(output));
+  findings.push(...findNextAppRuntimeIssues(output));
+  findings.push(...findDockerfileRuntimeIssues(output));
 
   return {
     status: findings.length > 0 ? 'NEEDS_FIX' : 'PASS',

@@ -1,7 +1,11 @@
+import { recordLlmUsage } from '@/lib/llm/usage-tracker';
+import type { AgentId } from '@/lib/types';
+
 interface OpenRouterInput {
   system: string;
   user: string;
   images?: Array<{ dataUrl: string }>;
+  agentId?: AgentId;
   model?: string;
   temperature?: number;
   maxTokens?: number;
@@ -31,19 +35,45 @@ interface OpenRouterRequestBody {
   provider?: {
     require_parameters: true;
   };
+  usage?: {
+    include: true;
+  };
 }
 
 interface OpenRouterResponse {
+  id?: string;
   choices?: Array<{
     finish_reason?: string;
     message?: {
       content?: string | Array<{ text?: string }>;
     };
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    cost?: number;
+  };
 }
 
 const DEFAULT_MODEL = 'google/gemini-2.5-pro';
 const DEFAULT_MAX_TOKENS = 65_536;
+const MODEL_PRICING_PER_TOKEN: Record<string, { prompt: number; completion: number }> = {
+  'google/gemini-2.5-flash': { prompt: 0.0000003, completion: 0.0000025 },
+  'google/gemini-2.5-pro': { prompt: 0.00000125, completion: 0.00001 },
+  'anthropic/claude-haiku-4.5': { prompt: 0.000001, completion: 0.000005 },
+  'anthropic/claude-sonnet-4.6': { prompt: 0.000003, completion: 0.000015 },
+  'anthropic/claude-opus-4.7': { prompt: 0.000005, completion: 0.000025 }
+};
+
+function numericUsageValue(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
 
 function readPositiveIntEnv(name: string, fallback: number) {
   const raw = process.env[name];
@@ -76,6 +106,7 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
     model,
     temperature: input.temperature ?? 0.2,
     max_tokens: maxTokens,
+    usage: { include: true },
     messages: [
       { role: 'system', content: input.system },
       { role: 'user', content: userContent }
@@ -122,6 +153,27 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
   }
 
   const data = (await response.json()) as OpenRouterResponse;
+  const usage = data.usage;
+  if (input.agentId && usage) {
+    const promptTokens = numericUsageValue(usage.prompt_tokens);
+    const completionTokens = numericUsageValue(usage.completion_tokens);
+    const totalTokens = numericUsageValue(usage.total_tokens) || promptTokens + completionTokens;
+    const fallbackPricing = MODEL_PRICING_PER_TOKEN[model];
+    const fallbackCost = fallbackPricing ? promptTokens * fallbackPricing.prompt + completionTokens * fallbackPricing.completion : 0;
+    const responseCost = numericUsageValue(usage.cost);
+
+    recordLlmUsage({
+      agentId: input.agentId,
+      model,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      costUsd: responseCost || fallbackCost,
+      createdAt: new Date().toISOString(),
+      responseId: data.id
+    });
+  }
+
   const choice = data?.choices?.[0];
   if (choice?.finish_reason === 'length') {
     throw new Error(`OpenRouter response was truncated at ${maxTokens} max_tokens. Increase OPENROUTER_MAX_TOKENS or reduce generated output size.`);

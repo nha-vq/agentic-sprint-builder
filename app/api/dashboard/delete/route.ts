@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { deleteDashboardCompany } from '@/lib/dashboard';
+import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
 
 export const runtime = 'nodejs';
 
 export async function DELETE(request: NextRequest) {
   try {
+    assertRunApiAccess(request);
     const { searchParams } = new URL(request.url);
     const companyId = searchParams.get('company_id') || undefined;
 
@@ -22,6 +24,9 @@ export async function DELETE(request: NextRequest) {
       message: `Company ${result.company_id} deleted from dashboard.`
     });
   } catch (error) {
+    if (error instanceof ApiGuardError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+    }
     const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({ error: message }, { status: 400 });
   }

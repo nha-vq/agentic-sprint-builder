@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { registerDashboardCompany } from '@/lib/dashboard';
+import { createDashboardCompanyRecord, getDashboardIdentitySnapshot } from '@/lib/dashboard';
 import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
 
 export const runtime = 'nodejs';
@@ -7,18 +7,17 @@ export const runtime = 'nodejs';
 export async function POST(request: NextRequest) {
   try {
     assertRunApiAccess(request);
-    const result = await registerDashboardCompany();
+    await createDashboardCompanyRecord({ replaceExisting: true });
     return NextResponse.json({
-      ...result,
-      info: result.dashboardDisabled
-        ? 'Dashboard is disabled (ENABLE_DASHBOARD != true). Company not created on remote.'
-        : `Company "${result.name}" registered. company_id and agent ids are cached and saved to .env.local.`
+      ...getDashboardIdentitySnapshot(),
+      info: 'Existing saved dashboard agents/company were replaced. New company id is cached and saved to .env.local.'
     });
   } catch (error) {
     if (error instanceof ApiGuardError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
     }
-    const message = error instanceof Error ? error.message : 'Unknown error';
+
+    const message = error instanceof Error ? error.message : 'Dashboard company creation failed.';
     return NextResponse.json({ error: message }, { status: 400 });
   }
 }

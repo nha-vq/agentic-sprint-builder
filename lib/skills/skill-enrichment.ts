@@ -39,6 +39,9 @@ function buildTechEnrichment(preparedTechStack: PreparedTechStackOutput): string
   sections.push(`Package Manager: ${preparedTechStack.packageManager}`);
   sections.push(`Docker Strategy: ${preparedTechStack.dockerStrategy}`);
   sections.push(`Architecture: ${preparedTechStack.projectArchitecture}`);
+  if (preparedTechStack.devSkillGuidance) {
+    sections.push(`DEV Skill Guidance: ${preparedTechStack.devSkillGuidance}`);
+  }
 
   if (preparedTechStack.runtimeVersions?.length) {
     sections.push('\n### Runtime Versions');

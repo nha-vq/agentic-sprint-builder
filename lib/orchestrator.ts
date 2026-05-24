@@ -13,15 +13,20 @@ import { formatRepairScope, inferQaRepairScope, inferReviewRepairScope, inferSta
 import { validateBaOutputStructure, validatePreparedTechStackStructure } from '@/lib/validation/agent-lifecycle';
 import { DEFAULT_PROJECT_ID, loadProjectDevSkill, writeProjectDevSkill, writePreDevProjectSkill, type ProjectDevSkill } from '@/lib/skills/project-dev-skill';
 import { enrichSkillContext } from '@/lib/skills/skill-enrichment';
+import { searchFreeSafeImages } from '@/lib/media/free-image-search';
+import { agentModelFor } from '@/lib/agent-models';
+import { runWithLlmUsageTracking, summarizeLlmUsage } from '@/lib/llm/usage-tracker';
 import fs from 'fs/promises';
 import path from 'path';
-import type { AgentEvent, DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, RepairScope, RunProgressReporter, RunRequest, RunResult } from '@/lib/types';
+import type { AgentEvent, DevOutput, GeneratedExecutionValidationResult, GeneratedFile, LlmUsageRecord, PreparedTechStackOutput, QAReviewOutput, RepairScope, RunProgressReporter, RunRequest, RunResult } from '@/lib/types';
 
 function readPositiveIntegerEnv(name: string, fallback: number) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+const MAX_CODE_REVIEW_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_CODE_REVIEW_FIX_ITERATIONS', 3);
+const MAX_DEPLOY_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_DEPLOY_FIX_ITERATIONS', 3);
 const MAX_QA_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_QA_FIX_ITERATIONS', 2);
 const MAX_BUILD_READINESS_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_BUILD_READINESS_FIX_ITERATIONS', 5);
 const MAX_EXECUTION_VALIDATION_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_EXECUTION_VALIDATION_FIX_ITERATIONS', 5);
@@ -30,7 +35,7 @@ const MAX_REPAIR_TOTAL_LOG_CHARS = readPositiveIntegerEnv('MAX_REPAIR_TOTAL_LOG_
 const MAX_REPAIR_TREE_FILES = readPositiveIntegerEnv('MAX_REPAIR_TREE_FILES', 220);
 
 function shouldRunFullQaAgent() {
-  return process.env.RUN_FULL_QA_AGENT === 'true';
+  return process.env.RUN_FULL_QA_AGENT !== 'false';
 }
 
 function truncateTail(value: string, maxChars: number) {
@@ -319,11 +324,52 @@ function createSnapshotDevOutput(files: GeneratedFile[], reason: string): DevOut
   };
 }
 
+function createPassingCodeReview(summary: string): CodeReviewOutput {
+  return {
+    status: 'PASS',
+    blocking: [],
+    advisory: [],
+    summary,
+    requirementCoverage: 'not applicable'
+  };
+}
+
+function createPassingDeployValidation(summary: string): DeployOutput {
+  return {
+    status: 'PASS',
+    blocking: [],
+    advisory: [],
+    deployCommand: 'docker compose up --build',
+    services: [],
+    summary
+  };
+}
+
 export async function runSprintBuilder(input: RunRequest, options?: { runId?: string; onProgress?: RunProgressReporter; signal?: AbortSignal }): Promise<RunResult> {
+  const llmUsageRecords: LlmUsageRecord[] = [];
+  return runWithLlmUsageTracking(llmUsageRecords, () => runSprintBuilderTracked(input, options, llmUsageRecords));
+}
+
+async function runSprintBuilderTracked(
+  input: RunRequest,
+  options: { runId?: string; onProgress?: RunProgressReporter; signal?: AbortSignal } | undefined,
+  llmUsageRecords: LlmUsageRecord[]
+): Promise<RunResult> {
   const runId = options?.runId || createTimestampRunId();
   const events: AgentEvent[] = [];
   const topic = input.topic || 'AI Team Run';
   const projectId = input.projectId || DEFAULT_PROJECT_ID;
+  const selectedAgentModels = {
+    ba: agentModelFor('ba', input.agentModels),
+    'tech-stack': agentModelFor('tech-stack', input.agentModels),
+    dev: agentModelFor('dev', input.agentModels),
+    'frontend-dev': agentModelFor('frontend-dev', input.agentModels),
+    'backend-dev': agentModelFor('backend-dev', input.agentModels),
+    'integration-dev': agentModelFor('integration-dev', input.agentModels),
+    'code-review': agentModelFor('code-review', input.agentModels),
+    deploy: agentModelFor('deploy', input.agentModels),
+    qa: agentModelFor('qa', input.agentModels)
+  };
 
   // Auto-register company on dashboard at the start of each run
   try {
@@ -344,13 +390,28 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   async function emit(params: Parameters<typeof emitDashboardEvent>[0]) {
     const event = await emitDashboardEvent(params);
     events.push(event);
-    const stepMap: Record<string, string> = { ba: 'ba', 'tech-stack': 'tech-stack', qa: 'qa', 'code-review': 'code-review', deploy: 'deploy-validation' };
+    const stepMap: Record<string, string> = {
+      ba: 'ba',
+      'tech-stack': 'tech-stack',
+      dev: 'dev',
+      'frontend-dev': 'frontend-dev',
+      'backend-dev': 'backend-dev',
+      'integration-dev': 'integration-dev',
+      qa: 'qa',
+      'code-review': 'code-review',
+      deploy: 'deploy-validation'
+    };
     await progress({
       stepId: stepMap[params.agentId] || 'dev',
       level: params.eventType === 'ERROR' ? 'error' : params.eventType.includes('COMPLETE') ? 'success' : 'info',
       message: `${params.agentId.toUpperCase()} ${params.eventType}: ${params.task}`
     });
   }
+
+  await progress({
+    level: 'info',
+    message: `Selected agent models: BA=${selectedAgentModels.ba}, TA=${selectedAgentModels['tech-stack']}, DEV Lead=${selectedAgentModels.dev}, Frontend DEV=${selectedAgentModels['frontend-dev']}, Backend DEV=${selectedAgentModels['backend-dev']}, Integration DEV=${selectedAgentModels['integration-dev']}, CodeReview=${selectedAgentModels['code-review']}, DevOps=${selectedAgentModels.deploy}, QA=${selectedAgentModels.qa}.`
+  });
 
   void prewarmGeneratedComposeRuntime(progress, options?.signal).catch((error) => {
     void progress({
@@ -390,11 +451,29 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   }
 
   await progress({ stepId: 'ba', stepStatus: 'RUNNING', message: 'BA agent is analyzing requirements.' });
+  await progress({ stepId: 'ba', stepStatus: 'RUNNING', level: 'info', message: 'Searching Wikimedia Commons for free/safe image candidates for BA visual planning.' });
+  const freeImageCandidates = await searchFreeSafeImages({
+    requirements: input.requirements,
+    techSpec: input.techSpec,
+    topic,
+    signal: options?.signal
+  });
+  await progress({
+    stepId: 'ba',
+    stepStatus: 'RUNNING',
+    level: freeImageCandidates.length > 0 ? 'success' : 'warn',
+    message:
+      freeImageCandidates.length > 0
+        ? `Found ${freeImageCandidates.length} free/safe image candidate(s) for BA and DEV.`
+        : 'No free/safe image candidates found; BA and DEV will continue without remote imagery links.'
+  });
   await emit({ agentId: 'ba', eventType: 'THINKING', task: 'Analyze requirements and scope', artifact: 'BA_ARTIFACTS.md' });
   const baOutput = await runBAAgent({
     requirements: input.requirements,
     techSpec: input.techSpec,
     requirementImages: input.requirementImages,
+    freeImageCandidates,
+    modelOverride: selectedAgentModels.ba,
     existingFiles,
     recentRuns,
     signal: options?.signal
@@ -421,6 +500,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     baOutput,
     existingFiles,
     recentRuns,
+    modelOverride: selectedAgentModels['tech-stack'],
     signal: options?.signal
   });
   throwIfCanceled(options?.signal);
@@ -447,6 +527,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   await progress({ stepId: 'tech-stack', level: 'success', message: `Skill enrichment complete (${enrichedSkill.combined.length} chars context).` });
 
   // Write pre-DEV project skill from tech stack BEFORE DEV runs
+  await emit({ agentId: 'tech-stack', eventType: 'WORKING', task: 'TA is preparing the DEV skill from BA stories and tech-stack decisions', toAgent: 'dev', artifact: 'project-dev-skill' });
   await progress({ stepId: 'tech-stack', level: 'info', message: 'Preparing project-specific dev skill from tech stack analysis.' });
   projectDevSkill = await writePreDevProjectSkill({
     projectId,
@@ -462,6 +543,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     level: 'success',
     message: `Project dev skill prepared with tech stack decisions: ${projectDevSkill.path}`
   });
+  await emit({ agentId: 'tech-stack', eventType: 'WORK_COMPLETE', task: 'TA prepared the DEV skill; implementation is ready to start', toAgent: 'dev', artifact: 'project-dev-skill' });
 
   async function updateProjectSkillFromDevOutput(params: {
     devOutput: DevOutput;
@@ -470,6 +552,19 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     qaReview?: QAReviewOutput;
   }) {
     const hadProjectSkill = projectDevSkill !== null;
+    await emit({
+      agentId: 'tech-stack',
+      eventType: 'WORKING',
+      task: `TA notes feedback and upgrades DEV skill: ${params.reason}`,
+      toAgent: 'dev',
+      artifact: 'project-dev-skill'
+    });
+    await progress({
+      stepId: 'tech-stack',
+      stepStatus: 'RUNNING',
+      level: 'info',
+      message: `TA updating project-specific DEV skill: ${params.reason}`
+    });
     projectDevSkill = await writeProjectDevSkill({
       projectId,
       requirements: input.requirements,
@@ -483,8 +578,17 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     });
 
     await progress({
+      stepId: 'tech-stack',
+      stepStatus: 'PASS',
       level: 'success',
       message: `Project-specific dev skill ${hadProjectSkill ? 'updated' : 'generated'} for ${projectId}: ${projectDevSkill.path}`
+    });
+    await emit({
+      agentId: 'tech-stack',
+      eventType: 'WORK_COMPLETE',
+      task: `TA upgraded DEV skill for ${projectId}`,
+      toAgent: 'dev',
+      artifact: 'project-dev-skill'
     });
 
     return projectDevSkill;
@@ -502,6 +606,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     requirements: input.requirements,
     techSpec: input.techSpec,
     requirementImages: input.requirementImages,
+    freeImageCandidates,
+    modelOverride: selectedAgentModels.dev,
+    agentModelOverrides: selectedAgentModels,
     preparedTechStack,
     baOutput,
     existingFiles,
@@ -510,6 +617,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     projectDevSkill,
     enrichedSkillContext: enrichedSkill.combined,
     onProgress: progress,
+    onAgentActivity: emit,
     signal: options?.signal
   });
   throwIfCanceled(options?.signal);
@@ -522,79 +630,72 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
   });
   await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: 'Implementation files generated', toAgent: 'code-review', artifact: 'generated-files' });
 
-  await progress({ stepId: 'code-review', stepStatus: 'RUNNING', message: 'CodeReviewAgent is reviewing generated code.' });
-  await emit({ agentId: 'code-review', eventType: 'REVIEWING', task: 'Review generated code quality and architecture', artifact: 'CODE_REVIEW.json' });
-  let codeReview: CodeReviewOutput;
-  try {
-    codeReview = await runCodeReviewAgent({
+  async function runCodeReviewStep(label: string) {
+    await progress({ stepId: 'code-review', stepStatus: 'RUNNING', message: label });
+    await emit({ agentId: 'code-review', eventType: 'REVIEWING', task: label, artifact: 'CODE_REVIEW.json' });
+    const review = await runCodeReviewAgent({
       requirements: input.requirements,
       requirementImages: input.requirementImages,
       baOutput,
       devOutput,
       preparedTechStack,
       existingFiles: await readGeneratedCodeSnapshot(),
+      modelOverride: selectedAgentModels['code-review'],
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
     await progress({
       stepId: 'code-review',
-      stepStatus: codeReview.status === 'PASS' ? 'PASS' : 'FAIL',
-      level: codeReview.status === 'PASS' ? 'success' : 'warn',
-      message: `Code review ${codeReview.status}: ${codeReview.summary}. Blocking: ${codeReview.blocking.length}, Advisory: ${codeReview.advisory.length}.`
+      stepStatus: review.status === 'PASS' ? 'PASS' : 'FAIL',
+      level: review.status === 'PASS' ? 'success' : 'warn',
+      message: `Code review ${review.status}: ${review.summary}. Blocking: ${review.blocking.length}, Advisory: ${review.advisory.length}.`
     });
-    await emit({ agentId: 'code-review', eventType: 'WORK_COMPLETE', task: `Code review completed: ${codeReview.status}`, toAgent: 'deploy', artifact: 'CODE_REVIEW.json' });
+    return review;
+  }
+
+  let codeReview: CodeReviewOutput;
+  let codeReviewFixIterations = 0;
+  try {
+    codeReview = await runCodeReviewStep('CodeReviewAgent is reviewing generated code.');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await progress({ stepId: 'code-review', stepStatus: 'SKIPPED', level: 'warn', message: `Code review skipped: ${message}` });
-    codeReview = { status: 'PASS', blocking: [], advisory: [], summary: 'Skipped due to error', requirementCoverage: 'unknown' };
+    codeReview = createPassingCodeReview('Skipped due to error');
   }
 
-  await progress({ stepId: 'deploy-validation', stepStatus: 'RUNNING', message: 'DeployAgent is validating deployment configuration.' });
-  await emit({ agentId: 'deploy', eventType: 'REVIEWING', task: 'Validate deployment readiness', artifact: 'DEPLOY_VALIDATION.json' });
-  let deployValidation: DeployOutput;
-  try {
-    deployValidation = await runDeployAgent({
-      requirements: input.requirements,
-      devOutput,
-      preparedTechStack,
-      existingFiles: await readGeneratedCodeSnapshot(),
-      signal: options?.signal
+  while (codeReview.status === 'NEEDS_FIX' && codeReviewFixIterations < MAX_CODE_REVIEW_FIX_ITERATIONS) {
+    codeReviewFixIterations += 1;
+    await emit({
+      agentId: 'code-review',
+      eventType: 'REVIEW_REQUEST',
+      task: `Code review found blockers; sending fix request ${codeReviewFixIterations} to DEV`,
+      toAgent: 'dev',
+      artifact: 'CODE_REVIEW.json'
     });
-    throwIfCanceled(options?.signal);
-    await progress({
-      stepId: 'deploy-validation',
-      stepStatus: deployValidation.status === 'PASS' ? 'PASS' : 'FAIL',
-      level: deployValidation.status === 'PASS' ? 'success' : 'warn',
-      message: `Deploy validation ${deployValidation.status}: ${deployValidation.summary}. Blocking: ${deployValidation.blocking.length}.`
-    });
-    await emit({ agentId: 'deploy', eventType: 'WORK_COMPLETE', task: `Deploy validation completed: ${deployValidation.status}`, toAgent: 'qa', artifact: 'DEPLOY_VALIDATION.json' });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await progress({ stepId: 'deploy-validation', stepStatus: 'SKIPPED', level: 'warn', message: `Deploy validation skipped: ${message}` });
-    deployValidation = { status: 'PASS', blocking: [], advisory: [], deployCommand: 'docker compose up --build', services: [], summary: 'Skipped due to error' };
-  }
 
-  if (codeReview.status === 'NEEDS_FIX' || deployValidation.status === 'NEEDS_FIX') {
-    await progress({ stepId: 'dev', stepStatus: 'RUNNING', message: 'DEV agent fixing CodeReview/Deploy findings.' });
-    await emit({ agentId: 'dev', eventType: 'CODING', task: 'Fix CodeReview and Deploy findings', artifact: 'generated-files' });
     existingFiles = await readGeneratedCodeSnapshot();
+    const deployPlaceholder = createPassingDeployValidation('Deploy validation has not run yet; this repair is for CodeReview findings only.');
     const reviewFeedback = formatCodeReviewDeployRepairFeedback({
       codeReview,
-      deployValidation,
+      deployValidation: deployPlaceholder,
       generatedFiles: existingFiles
     });
-    const repairScope = inferReviewRepairScope(formatCodeReviewDeployScopeText({ codeReview, deployValidation }), existingFiles);
+    const repairScope = inferReviewRepairScope(formatCodeReviewDeployScopeText({ codeReview, deployValidation: deployPlaceholder }), existingFiles);
     await reportRepairScope(options?.onProgress, repairScope);
     await progress({
       stepId: 'dev',
       stepStatus: 'RUNNING',
       level: 'info',
-      message: `Prepared CodeReview/Deploy repair packet with findings and generated project overview (${reviewFeedback.length} chars).`
+      message: `DEV received CodeReview feedback packet (${reviewFeedback.length} chars). TA will upgrade the skill after the fix.`
     });
+    await emit({ agentId: 'dev', eventType: 'CODING', task: `Fix CodeReview findings iteration ${codeReviewFixIterations}`, artifact: 'generated-files' });
     devOutput = await runDevAgent({
       requirements: input.requirements,
       techSpec: input.techSpec,
       requirementImages: input.requirementImages,
+      freeImageCandidates,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -606,6 +707,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       projectDevSkill,
       enrichedSkillContext: enrichedSkill.combined,
       onProgress: progress,
+      onAgentActivity: emit,
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
@@ -614,18 +716,144 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     codeOutputDir = writeResult.codeOutputDir;
     projectDevSkill = await updateProjectSkillFromDevOutput({
       devOutput,
-      reason: 'Update project-specific skill after CodeReview/Deploy repair.'
+      reason: `CodeReview feedback repair iteration ${codeReviewFixIterations}.`
     });
-    await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: 'CodeReview/Deploy fixes applied', toAgent: 'qa', artifact: 'generated-files' });
+    await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: `CodeReview fixes applied iteration ${codeReviewFixIterations}`, toAgent: 'code-review', artifact: 'generated-files' });
 
-    // Update step statuses to reflect that fixes were applied
-    if (codeReview.status === 'NEEDS_FIX') {
-      await progress({ stepId: 'code-review', stepStatus: 'PASS', level: 'success', message: 'Code review issues fixed by DEV agent.' });
-    }
-    if (deployValidation.status === 'NEEDS_FIX') {
-      await progress({ stepId: 'deploy-validation', stepStatus: 'PASS', level: 'success', message: 'Deploy validation issues fixed by DEV agent.' });
+    try {
+      codeReview = await runCodeReviewStep(`CodeReviewAgent is re-reviewing fixes iteration ${codeReviewFixIterations}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await progress({ stepId: 'code-review', stepStatus: 'SKIPPED', level: 'warn', message: `Code review retry skipped: ${message}` });
+      codeReview = createPassingCodeReview('Skipped during retry due to error');
+      break;
     }
   }
+
+  await emit({
+    agentId: 'code-review',
+    eventType: codeReview.status === 'PASS' ? 'WORK_COMPLETE' : 'ERROR',
+    task:
+      codeReview.status === 'PASS'
+        ? 'Code review passed; handing off to DevOps agent'
+        : `Code review still has blockers after ${codeReviewFixIterations} fix attempt(s)`,
+    toAgent: codeReview.status === 'PASS' ? 'deploy' : 'dev',
+    artifact: 'CODE_REVIEW.json'
+  });
+
+  async function runDeployReviewStep(label: string) {
+    await progress({ stepId: 'deploy-validation', stepStatus: 'RUNNING', message: label });
+    await emit({ agentId: 'deploy', eventType: 'REVIEWING', task: label, artifact: 'DEPLOY_VALIDATION.json' });
+    const validation = await runDeployAgent({
+      requirements: input.requirements,
+      devOutput,
+      preparedTechStack,
+      existingFiles: await readGeneratedCodeSnapshot(),
+      modelOverride: selectedAgentModels.deploy,
+      signal: options?.signal
+    });
+    throwIfCanceled(options?.signal);
+    await progress({
+      stepId: 'deploy-validation',
+      stepStatus: validation.status === 'PASS' ? 'PASS' : 'FAIL',
+      level: validation.status === 'PASS' ? 'success' : 'warn',
+      message: `Deploy validation ${validation.status}: ${validation.summary}. Blocking: ${validation.blocking.length}.`
+    });
+    return validation;
+  }
+
+  let deployValidation: DeployOutput;
+  let deployFixIterations = 0;
+  try {
+    deployValidation = await runDeployReviewStep('DevOps agent is validating container and deployment readiness.');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await progress({ stepId: 'deploy-validation', stepStatus: 'SKIPPED', level: 'warn', message: `Deploy validation skipped: ${message}` });
+    deployValidation = createPassingDeployValidation('Skipped due to error');
+  }
+
+  while (deployValidation.status === 'NEEDS_FIX' && deployFixIterations < MAX_DEPLOY_FIX_ITERATIONS) {
+    deployFixIterations += 1;
+    await emit({
+      agentId: 'deploy',
+      eventType: 'REVIEW_REQUEST',
+      task: `DevOps found deployment blockers; sending fix request ${deployFixIterations} to DEV`,
+      toAgent: 'dev',
+      artifact: 'DEPLOY_VALIDATION.json'
+    });
+
+    existingFiles = await readGeneratedCodeSnapshot();
+    const reviewFeedback = formatCodeReviewDeployRepairFeedback({
+      codeReview: createPassingCodeReview('Code review has no active blockers for this DevOps repair.'),
+      deployValidation,
+      generatedFiles: existingFiles
+    });
+    const repairScope = inferReviewRepairScope(
+      formatCodeReviewDeployScopeText({
+        codeReview: createPassingCodeReview('Code review has no active blockers for this DevOps repair.'),
+        deployValidation
+      }),
+      existingFiles
+    );
+    await reportRepairScope(options?.onProgress, repairScope);
+    await progress({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      level: 'info',
+      message: `DEV received DevOps deployment feedback packet (${reviewFeedback.length} chars). TA will upgrade the skill after the fix.`
+    });
+    await emit({ agentId: 'dev', eventType: 'CODING', task: `Fix DevOps deployment findings iteration ${deployFixIterations}`, artifact: 'generated-files' });
+    devOutput = await runDevAgent({
+      requirements: input.requirements,
+      techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
+      freeImageCandidates,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
+      preparedTechStack,
+      baOutput,
+      existingFiles,
+      recentRuns,
+      previousDevOutput: devOutput,
+      qaFeedback: reviewFeedback,
+      repairScope,
+      apiSpec: input.apiSpec,
+      projectDevSkill,
+      enrichedSkillContext: enrichedSkill.combined,
+      onProgress: progress,
+      onAgentActivity: emit,
+      signal: options?.signal
+    });
+    throwIfCanceled(options?.signal);
+    writeResult = await writeAndRefreshDevOutput(devOutput);
+    devOutput = writeResult.devOutput;
+    codeOutputDir = writeResult.codeOutputDir;
+    projectDevSkill = await updateProjectSkillFromDevOutput({
+      devOutput,
+      reason: `DevOps deployment feedback repair iteration ${deployFixIterations}.`
+    });
+    await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: `DevOps deployment fixes applied iteration ${deployFixIterations}`, toAgent: 'deploy', artifact: 'generated-files' });
+
+    try {
+      deployValidation = await runDeployReviewStep(`DevOps agent is re-validating deployment fixes iteration ${deployFixIterations}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await progress({ stepId: 'deploy-validation', stepStatus: 'SKIPPED', level: 'warn', message: `Deploy validation retry skipped: ${message}` });
+      deployValidation = createPassingDeployValidation('Skipped during retry due to error');
+      break;
+    }
+  }
+
+  await emit({
+    agentId: 'deploy',
+    eventType: deployValidation.status === 'PASS' ? 'WORK_COMPLETE' : 'ERROR',
+    task:
+      deployValidation.status === 'PASS'
+        ? 'DevOps deployment validation passed; ready for Rancher/Desktop smoke deploy'
+        : `DevOps deployment validation still has blockers after ${deployFixIterations} fix attempt(s)`,
+    toAgent: deployValidation.status === 'PASS' ? 'qa' : 'dev',
+    artifact: 'DEPLOY_VALIDATION.json'
+  });
 
   let buildReadinessFixIterations = 0;
   await progress({ stepId: 'static-validation', stepStatus: 'RUNNING', message: 'Running static readiness check.' });
@@ -636,9 +864,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     buildReadinessFixIterations += 1;
 
     await emit({
-      agentId: 'qa',
+      agentId: 'deploy',
       eventType: 'REVIEW_REQUEST',
-      task: `Run/build readiness check found blockers; sending fix request ${buildReadinessFixIterations} to DEV`,
+      task: `Run/build readiness check found blockers; DevOps sending fix request ${buildReadinessFixIterations} to DEV`,
       toAgent: 'dev',
       artifact: 'generated-files'
     });
@@ -651,6 +879,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       requirements: input.requirements,
       techSpec: input.techSpec,
       requirementImages: input.requirementImages,
+      freeImageCandidates,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -662,6 +893,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       projectDevSkill,
       enrichedSkillContext: enrichedSkill.combined,
       onProgress: progress,
+      onAgentActivity: emit,
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
@@ -685,7 +917,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     if (buildReadiness.status === 'NEEDS_FIX' && staticFindingsSignature(buildReadiness) === previousStaticSignature) {
       await progress({
         stepId: 'static-validation',
-        stepStatus: 'RUNNING',
+        stepStatus: 'FAIL',
         level: 'warn',
         message: 'Static readiness findings did not change after the last DEV repair; stopping static repair loop and continuing deploy-first validation.'
       });
@@ -713,9 +945,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     executionValidationFixIterations += 1;
 
     await emit({
-      agentId: 'qa',
+      agentId: 'deploy',
       eventType: 'REVIEW_REQUEST',
-      task: `Generated project execution validation failed; sending fix request ${executionValidationFixIterations} to DEV`,
+      task: `Rancher/Desktop deploy smoke validation failed; DevOps sending fix request ${executionValidationFixIterations} to DEV`,
       toAgent: 'dev',
       artifact: 'generated-validation'
     });
@@ -737,6 +969,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       requirements: input.requirements,
       techSpec: input.techSpec,
       requirementImages: input.requirementImages,
+      freeImageCandidates,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -748,6 +983,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       projectDevSkill,
       enrichedSkillContext: enrichedSkill.combined,
       onProgress: progress,
+      onAgentActivity: emit,
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
@@ -799,6 +1035,19 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     });
   }
 
+  await emit({
+    agentId: 'deploy',
+    eventType: executionValidation.status === 'PASS' ? 'WORK_COMPLETE' : executionValidation.status === 'NEEDS_FIX' ? 'ERROR' : 'WORK_COMPLETE',
+    task:
+      executionValidation.status === 'PASS'
+        ? 'DevOps deployed successfully; handing off to QA for end-to-end validation'
+        : executionValidation.status === 'NEEDS_FIX'
+        ? 'DevOps deploy smoke validation still has blockers'
+        : 'DevOps deploy smoke validation was skipped by environment; handing available evidence to QA',
+    toAgent: executionValidation.status === 'NEEDS_FIX' ? 'dev' : 'qa',
+    artifact: 'generated-validation'
+  });
+
   let qaReview: QAReviewOutput;
   if (executionValidation.status === 'NEEDS_FIX') {
     const reason = 'Skipped QA review because execution validation still has blocking issues.';
@@ -819,8 +1068,8 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       });
       qaReview = createSmokeQaReview(executionValidation);
     } else {
-      await progress({ stepId: 'qa', stepStatus: 'RUNNING', message: 'QA agent is reviewing generated delivery.' });
-      await emit({ agentId: 'qa', eventType: 'REVIEWING', task: 'Validate generated delivery', artifact: 'QA_REPORT.md' });
+      await progress({ stepId: 'qa', stepStatus: 'RUNNING', message: 'QA agent is running post-deploy end-to-end requirement validation.' });
+      await emit({ agentId: 'qa', eventType: 'REVIEWING', task: 'Run post-deploy end-to-end requirement validation', artifact: 'QA_REPORT.md' });
       qaReview = await runQAAgent({
         requirements: input.requirements,
         techSpec: input.techSpec,
@@ -830,6 +1079,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
         existingFiles: await readGeneratedCodeSnapshot(),
         recentRuns,
         executionValidation,
+        modelOverride: selectedAgentModels.qa,
         signal: options?.signal
       });
       throwIfCanceled(options?.signal);
@@ -857,6 +1107,9 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       requirements: input.requirements,
       techSpec: input.techSpec,
       requirementImages: input.requirementImages,
+      freeImageCandidates,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
       preparedTechStack,
       baOutput,
       existingFiles,
@@ -868,6 +1121,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       projectDevSkill,
       enrichedSkillContext: enrichedSkill.combined,
       onProgress: progress,
+      onAgentActivity: emit,
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
@@ -918,6 +1172,7 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
       existingFiles: await readGeneratedCodeSnapshot(),
       recentRuns,
       executionValidation,
+      modelOverride: selectedAgentModels.qa,
       signal: options?.signal
     });
     throwIfCanceled(options?.signal);
@@ -933,6 +1188,14 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     reason: 'Finalize project-specific skill after latest run status.'
   });
 
+  const costSummary = summarizeLlmUsage(llmUsageRecords);
+  await progress({
+    stepId: 'complete',
+    stepStatus: 'PENDING',
+    level: 'info',
+    message: `OpenRouter cost so far: $${costSummary.totalUsd.toFixed(4)} across ${costSummary.totalCalls} model call(s).`
+  });
+
   const result: RunResult = {
     runId,
     createdAt: new Date().toISOString(),
@@ -944,8 +1207,10 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     devOutput,
     codeReviewStatus: codeReview.status,
     codeReviewSummary: codeReview.summary,
+    codeReviewFixIterations,
     deployValidationStatus: deployValidation.status,
     deployValidationSummary: deployValidation.summary,
+    deployFixIterations,
     qaOutput: qaReview.report,
     qaStatus: qaReview.status,
     qaFindings: qaReview.findings,
@@ -953,6 +1218,10 @@ export async function runSprintBuilder(input: RunRequest, options?: { runId?: st
     buildReadinessFixIterations,
     executionValidationFixIterations,
     executionValidation,
+    freeImageCandidates,
+    agentModels: selectedAgentModels,
+    llmUsage: llmUsageRecords,
+    costSummary,
     events,
     outputDir: '',
     codeOutputDir

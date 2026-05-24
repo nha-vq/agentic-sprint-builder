@@ -164,6 +164,7 @@ export async function runQAAgent(input: {
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
   executionValidation?: GeneratedExecutionValidationResult;
+  modelOverride?: string;
   signal?: AbortSignal;
 }): Promise<QAReviewOutput> {
   const techSpec = input.techSpec?.trim() || 'Not provided';
@@ -173,6 +174,7 @@ export async function runQAAgent(input: {
     try {
       const raw = await runMarkdownSkillAgent({
         agentId: 'qa',
+        modelOverride: input.modelOverride,
         maxTokens: attempt === 1 ? 12_288 : 16_384,
         jsonSchema: {
           name: 'qa_review_output',
