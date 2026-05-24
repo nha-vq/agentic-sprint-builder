@@ -130,7 +130,7 @@ function truncate(value: string, maxChars = LOG_TAIL_CHARS) {
 }
 
 function isHostComposeInfrastructureFailure(message: string) {
-  return /failed to connect to the backend|timed out dialing hyper-v socket|cannot connect to the docker daemon|docker daemon is not running|error during connect|containerd socket|no such file or directory.*docker|rancher desktop|wsl.*docker/i.test(
+  return /failed to connect to the backend|timed out dialing hyper-v socket|cannot connect to the docker daemon|docker daemon is not running|error during connect|open \/\/\.\/pipe\/docker_engine|containerd socket|rancher desktop.*(?:not ready|unavailable)|docker compose engine is unavailable|local compose engine is unavailable|must be run with elevated privileges|wsl.*docker/i.test(
     message
   );
 }
@@ -337,6 +337,23 @@ function lastOutputLines(output: string, maxLines = 8) {
     .join('\n');
 }
 
+function quoteWindowsShellArg(value: string) {
+  if (!value) return '""';
+  if (!/[\s&()<>^|"]/u.test(value)) return value;
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function resolveSpawnCommand(command: string, args: string[]) {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/iu.test(command)) {
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', [command, ...args].map(quoteWindowsShellArg).join(' ')]
+    };
+  }
+
+  return { command, args };
+}
+
 function runCommand(
   command: string,
   args: string[],
@@ -348,7 +365,20 @@ function runCommand(
   return new Promise((resolve) => {
     let settled = false;
     let output = '';
-    const child = spawn(command, args, { cwd, windowsHide: true });
+    const spawnCommand = resolveSpawnCommand(command, args);
+    let child: ReturnType<typeof spawn>;
+
+    try {
+      child = spawn(spawnCommand.command, spawnCommand.args, { cwd, windowsHide: true });
+    } catch (error) {
+      resolve({
+        ok: false,
+        output,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return;
+    }
+
     const startedAt = Date.now();
 
     const appendOutput = (chunk: Buffer) => {

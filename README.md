@@ -9,24 +9,30 @@ requirements.md + tech-spec.md
         ↓
 Orchestrator
         ↓
-BA Agent → PRD + stories + acceptance criteria
+BA Agent → user stories + DEV/QA artifacts
         ↓
-DEV Agent → architecture + generated implementation files
+TA Agent → tech stack analysis + DEV skill upgrade
         ↓
-QA Agent → test cases + QA report
+DEV Agent → generated implementation files
+        ↓
+Code Review → quality gate + fix requests
+        ↓
+DevOps Agent → containers + Rancher/Desktop deploy validation
+        ↓
+QA Agent → post-deploy end-to-end validation
         ↓
 Contest Dashboard events
 ```
 
 ## Why this project fits the contest
 
-- Uses a real multi-agent workflow: BA, DEV, QA.
+- Uses a real multi-agent workflow: BA, TA, DEV, Code Review, DevOps, QA.
 - Agent skills are written in Markdown under `.github/skills/`.
 - Uses OpenRouter API as the LLM gateway.
 - Emits dashboard events using the provided contest API.
 - Generates Phase 1 implementation artifacts from requirements.
-- Includes a DEV feedback loop for run/build readiness and QA blockers.
-- Feeds existing generated code and recent run history back into BA, DEV, and QA agents for incremental changes.
+- Includes DEV feedback loops for Code Review, DevOps/deploy readiness, run/build readiness, and QA blockers.
+- Feeds existing generated code and recent run history back into BA, DEV, Code Review, DevOps, and QA agents for incremental changes.
 - Generates and reuses project-specific DEV skills under `project-skills/` so future feature work preserves the generated stack and structure.
 
 ## Setup
@@ -72,10 +78,20 @@ GENERATED_BACKEND_PORT=8000
 GENERATED_FRONTEND_PORT=3001
 CLEAN_GENERATED_COMPOSE=true
 REMOVE_GENERATED_COMPOSE_IMAGES=false
-RUN_FULL_QA_AGENT=false
+RUN_FULL_QA_AGENT=true
 DASHBOARD_BASE_URL=https://aitechcontest.kms-technology.com/api
 DASHBOARD_COMPANY_ID=
-DASHBOARD_COMPANY_NAME=Agentic Sprint Builder
+DASHBOARD_AGENT_IDS=
+DASHBOARD_AGENT_BA_ID=
+DASHBOARD_AGENT_TECH_STACK_ID=
+DASHBOARD_AGENT_DEV_ID=
+DASHBOARD_AGENT_CODE_REVIEW_ID=
+DASHBOARD_AGENT_DEPLOY_ID=
+DASHBOARD_AGENT_QA_ID=
+DASHBOARD_AGENT_CREATE_PATH=
+DASHBOARD_AGENT_DELETE_PATH=
+DASHBOARD_REQUIRE_AGENT_IDS=false
+DASHBOARD_COMPANY_NAME=Thermo Mini
 ```
 
 ## Dashboard registration
@@ -95,6 +111,22 @@ DASHBOARD_COMPANY_ID=returned-company-id
 ```
 
 Restart `npm run dev`.
+
+Registration persists dashboard identity to `.env.local`: `DASHBOARD_COMPANY_ID`, `DASHBOARD_AGENT_IDS`, and individual `DASHBOARD_AGENT_*_ID` values. Events use stored dashboard agent IDs for `agent_id` and `to_agent`, while retaining logical IDs in the event payload.
+
+By default the client creates the company, then tries agent creation at `/companies/{company_id}/agents` and `/agents`. If your dashboard exposes a different endpoint, set:
+
+```bash
+DASHBOARD_AGENT_CREATE_PATH=/companies/{company_id}/agents
+```
+
+For non-standard agent deletion endpoints, set:
+
+```bash
+DASHBOARD_AGENT_DELETE_PATH=/companies/{company_id}/agents/{agent_id}
+```
+
+Set `DASHBOARD_REQUIRE_AGENT_IDS=true` to fail registration when remote agent IDs cannot be created or stored.
 
 ## How skills work
 
@@ -128,7 +160,7 @@ temperature: 0.2
 ## Main files
 
 ```text
-lib/orchestrator.ts              # Controls BA -> prepare-tech-stack -> DEV -> QA workflow
+lib/orchestrator.ts              # Controls BA -> TA -> DEV -> CodeReview -> DevOps -> QA workflow
 lib/openrouter.ts                # OpenRouter client
 lib/dashboard.ts                 # Contest dashboard client
 lib/skills/loadSkill.ts          # Markdown skill loader
@@ -154,14 +186,19 @@ app/runs/[runId]/page.tsx        # Per-run output UI
 1. Paste `requirements.md`.
 2. Optionally paste `tech-spec.md`.
 3. Click **Run AI Team**.
-4. Watch the BA, prepare-tech-stack, DEV, and QA outputs.
-5. Check dashboard for events if `ENABLE_DASHBOARD=true` and `DASHBOARD_COMPANY_ID` is set.
-6. Run artifacts are written under `generated-runs/{yyyy-MM-dd-HH-mm-ss}`.
-7. DEV-generated source files are written to the fixed `generated-code/` workspace.
-8. If `VALIDATE_GENERATED_EXECUTION` is not `false`, the generated project is copied into an ignored validation workspace, then built, started, and smoke-checked. Compose validation tries `docker compose` first, then Rancher/containerd `nerdctl compose`; set `GENERATED_COMPOSE_ENGINE=docker` or `GENERATED_COMPOSE_ENGINE=nerdctl` to force one. If Compose is skipped because Docker/Rancher is unavailable, `FALLBACK_LOCAL_VALIDATION_WHEN_COMPOSE_SKIPPED=true` runs local Node/Python validation instead of blocking the whole run.
-9. At run start, `AUTO_START_RANCHER_DESKTOP=true` prewarms Rancher/Docker in the background while BA/DEV agents run. Before Compose validation, the orchestrator checks whether the selected Compose engine and container runtime are ready. If not, it starts Rancher Desktop with `rdctl` when available, waits up to `RANCHER_START_TIMEOUT_MS`, then runs Compose. Set `RANCHER_RDCTL_PATH` or `RANCHER_DESKTOP_PATH` if Rancher Desktop is installed in a custom location.
-10. Before each Compose validation, `CLEAN_GENERATED_COMPOSE=true` runs `compose down --remove-orphans` for the `agentic-sprint-builder-generated` project name to free ports from the previous generated run. It does not remove unrelated containers. Set `REMOVE_GENERATED_COMPOSE_IMAGES=true` to also remove local images for that generated Compose project.
-11. By default, deploy-first smoke validation is the runtime gate. Set `RUN_FULL_QA_AGENT=true` to run the QA agent after smoke validation for requirement coverage checks against the requirements and BA output.
+4. Watch BA create DEV/QA-ready user stories and artifacts.
+5. Watch TA analyze the tech stack, prepare the DEV skill, and later upgrade it after feedback.
+6. Watch DEV implement from BA output plus TA skill context.
+7. Watch Code Review request focused DEV fixes until code is acceptable.
+8. Watch DevOps validate containers, Compose, ports, healthchecks, and Rancher/Desktop deploy readiness.
+9. Watch QA run post-deploy end-to-end requirement validation and request DEV fixes if behavior does not match the BA artifact.
+10. Check dashboard for agent-to-agent events if `ENABLE_DASHBOARD=true`.
+11. Run artifacts are written under `generated-runs/{yyyy-MM-dd-HH-mm-ss}`.
+12. DEV-generated source files are written to the fixed `generated-code/` workspace.
+13. If `VALIDATE_GENERATED_EXECUTION` is not `false`, the generated project is copied into an ignored validation workspace, then built, started, and smoke-checked. Compose validation tries `docker compose` first, then Rancher/containerd `nerdctl compose`; set `GENERATED_COMPOSE_ENGINE=docker` or `GENERATED_COMPOSE_ENGINE=nerdctl` to force one. If Compose is skipped because Docker/Rancher is unavailable, `FALLBACK_LOCAL_VALIDATION_WHEN_COMPOSE_SKIPPED=true` runs local Node/Python validation instead of blocking the whole run.
+14. At run start, `AUTO_START_RANCHER_DESKTOP=true` prewarms Rancher/Docker in the background while BA/DEV agents run. Before Compose validation, the orchestrator checks whether the selected Compose engine and container runtime are ready. If not, it starts Rancher Desktop with `rdctl` when available, waits up to `RANCHER_START_TIMEOUT_MS`, then runs Compose. Set `RANCHER_RDCTL_PATH` or `RANCHER_DESKTOP_PATH` if Rancher Desktop is installed in a custom location.
+15. Before each Compose validation, `CLEAN_GENERATED_COMPOSE=true` runs `compose down --remove-orphans` for the `agentic-sprint-builder-generated` project name to free ports from the previous generated run. It does not remove unrelated containers. Set `REMOVE_GENERATED_COMPOSE_IMAGES=true` to also remove local images for that generated Compose project.
+16. By default, QA runs after deploy smoke validation. Set `RUN_FULL_QA_AGENT=false` only when you want deploy smoke validation to be the acceptance gate without full QA review.
 
 On each run, the agents read the current `generated-code/` snapshot plus recent `generated-runs/` history so feature changes can be handled incrementally instead of recreating the project from scratch.
 

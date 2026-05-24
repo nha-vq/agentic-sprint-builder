@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { RUN_LIMITS } from '@/lib/config/limits';
 import { createTimestampRunId, runSprintBuilder } from '@/lib/orchestrator';
+import { AGENT_MODEL_IDS } from '@/lib/agent-models';
 import { clearRunController, completeRunStatus, createRunStatus, failRunStatus, isRunCanceled, registerRunController, updateRunProgress } from '@/lib/runs/run-status-store';
 import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
 
@@ -18,13 +19,29 @@ const RequirementImageSchema = z.object({
   )
 });
 
+const AgentModelSchema = z.enum(AGENT_MODEL_IDS);
+const AgentModelsSchema = z
+  .object({
+    ba: AgentModelSchema.optional(),
+    'tech-stack': AgentModelSchema.optional(),
+    dev: AgentModelSchema.optional(),
+    'frontend-dev': AgentModelSchema.optional(),
+    'backend-dev': AgentModelSchema.optional(),
+    'integration-dev': AgentModelSchema.optional(),
+    'code-review': AgentModelSchema.optional(),
+    deploy: AgentModelSchema.optional(),
+    qa: AgentModelSchema.optional()
+  })
+  .partial();
+
 const RunRequestSchema = z.object({
   requirements: z.string().min(10).max(RUN_LIMITS.requirementsChars),
   techSpec: z.string().max(RUN_LIMITS.techSpecChars).nullable().optional(),
   apiSpec: z.string().max(RUN_LIMITS.apiSpecChars).optional(),
   topic: z.string().max(RUN_LIMITS.topicChars).optional(),
   projectId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(80).optional(),
-  requirementImages: z.array(RequirementImageSchema).max(RUN_LIMITS.requirementImages).nullable().optional()
+  requirementImages: z.array(RequirementImageSchema).max(RUN_LIMITS.requirementImages).nullable().optional(),
+  agentModels: AgentModelsSchema.nullable().optional()
 });
 
 function errorResponse(error: unknown) {

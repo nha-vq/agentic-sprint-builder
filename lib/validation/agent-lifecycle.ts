@@ -50,6 +50,7 @@ const REQUIRED_TECH_STACK_KEYS = [
   'servicePorts',
   'environmentVariables',
   'projectArchitecture',
+  'devSkillGuidance',
   'assumptions',
   'tradeoffs'
 ];

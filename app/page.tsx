@@ -3,13 +3,32 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { DEFAULT_REQUIREMENTS, DEFAULT_TECH_SPEC } from '@/lib/default-run-inputs';
-import type { RequirementImage, RunResult, RunStatusSnapshot } from '@/lib/types';
+import { AGENT_MODEL_OPTIONS, DEFAULT_AGENT_MODELS } from '@/lib/agent-models';
+import type { AgentId, AgentModelMap, RequirementImage, RunResult, RunStatusSnapshot } from '@/lib/types';
+
+type DashboardAgentView = {
+  agent_id: AgentId;
+  name: string;
+  role: string;
+  description?: string;
+  dashboard_agent_id?: string | null;
+  created?: boolean;
+};
+
+type DashboardStatus = {
+  dashboardEnabled: boolean;
+  company_id?: string | null;
+  name?: string;
+  agents: DashboardAgentView[];
+  info?: string;
+};
 
 export default function HomePage() {
   const [requirements, setRequirements] = useState(DEFAULT_REQUIREMENTS);
   const [techSpec, setTechSpec] = useState(DEFAULT_TECH_SPEC);
   const [requirementImages, setRequirementImages] = useState<RequirementImage[]>([]);
-  const [cleanBeforeRun, setCleanBeforeRun] = useState(false);
+  const [agentModels, setAgentModels] = useState<AgentModelMap>(DEFAULT_AGENT_MODELS);
+  const [cleanBeforeRun, setCleanBeforeRun] = useState(true);
   const [result, setResult] = useState<RunResult | null>(null);
   const [liveStatus, setLiveStatus] = useState<RunStatusSnapshot | null>(null);
   const [progressModalOpen, setProgressModalOpen] = useState(false);
@@ -18,7 +37,13 @@ export default function HomePage() {
   const [error, setError] = useState('');
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [lastCompanyId, setLastCompanyId] = useState('');
+  const [dashboardStatus, setDashboardStatus] = useState<DashboardStatus | null>(null);
+  const [dashboardLoading, setDashboardLoading] = useState(false);
   const [dismissedRancherToastKey, setDismissedRancherToastKey] = useState('');
+
+  useEffect(() => {
+    void refreshDashboardStatus();
+  }, []);
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,6 +91,7 @@ export default function HomePage() {
           requirements,
           techSpec: techSpec.trim() ? techSpec : null,
           requirementImages: requirementImages.length > 0 ? requirementImages : null,
+          agentModels,
           topic: 'New Full-Stack App'
         })
       });
@@ -105,17 +131,50 @@ export default function HomePage() {
     }
   }
 
-  async function registerDashboard() {
-    setError('');
+  async function refreshDashboardStatus() {
     try {
-      const response = await fetch('/api/dashboard/register', { method: 'POST' });
+      const response = await fetch('/api/dashboard/status', { cache: 'no-store' });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Dashboard registration failed');
+      if (!response.ok) throw new Error(data.error || 'Dashboard status lookup failed');
+      setDashboardStatus(data);
       if (data.company_id) setLastCompanyId(data.company_id);
-      alert(`Company "${data.name}" registered!\nID: ${data.company_id}\n(auto-saved to .env.local)`);
+    } catch {
+      // Keep the main workflow usable even if dashboard status is unavailable.
+    }
+  }
+
+  async function runDashboardAction(action: () => Promise<Response>) {
+    setError('');
+    setDashboardLoading(true);
+    try {
+      const response = await action();
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Dashboard action failed');
+      setDashboardStatus(data);
+      if (data.company_id) setLastCompanyId(data.company_id);
+      await refreshDashboardStatus();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setDashboardLoading(false);
     }
+  }
+
+  async function createCompany() {
+    await runDashboardAction(() => fetch('/api/dashboard/company', { method: 'POST' }));
+  }
+
+  async function createAgents() {
+    const companyId = dashboardStatus?.company_id || lastCompanyId;
+    const query = companyId ? `?company_id=${encodeURIComponent(companyId)}` : '';
+    await runDashboardAction(() => fetch(`/api/dashboard/agents${query}`, { method: 'POST' }));
+  }
+
+  async function deleteAgents() {
+    if (!window.confirm('Delete saved dashboard agents?')) return;
+    const companyId = dashboardStatus?.company_id || lastCompanyId;
+    const query = companyId ? `?company_id=${encodeURIComponent(companyId)}` : '';
+    await runDashboardAction(() => fetch(`/api/dashboard/agents${query}`, { method: 'DELETE' }));
   }
 
   async function deleteCompany(companyId: string) {
@@ -124,50 +183,82 @@ export default function HomePage() {
       const response = await fetch(`/api/dashboard/delete?company_id=${encodeURIComponent(companyId)}`, { method: 'DELETE' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Delete failed');
-      alert(`Company ${data.company_id} deleted.`);
       if (lastCompanyId === companyId) setLastCompanyId('');
+      setDashboardStatus((current) => current ? { ...current, company_id: null, agents: current.agents.map((agent) => ({ ...agent, dashboard_agent_id: null, created: false })) } : current);
       setDeleteModalOpen(false);
+      await refreshDashboardStatus();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     }
   }
 
   return (
-    <main className="min-h-screen p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <section className="rounded-3xl bg-white p-8 shadow-sm">
+    <main className="min-h-screen p-3 md:p-4">
+      <div className="mx-auto max-w-7xl space-y-3 md:space-y-4">
+        <section className="rounded-3xl bg-white p-4 shadow-sm md:p-5">
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>
               <p className="text-sm font-semibold uppercase tracking-wide text-blue-600">AI Tech Contest Phase 1</p>
-              <h1 className="mt-2 text-4xl font-bold">Agentic Sprint Builder</h1>
-              <p className="mt-3 max-w-3xl text-slate-600">
-                Markdown-skill BA, DEV, and QA agents read requirements, generate artifacts, write implementation files,
-                and emit dashboard events through an orchestrated SDLC flow.
-              </p>
+              <h1 className="mt-1 text-3xl font-bold md:text-4xl">Agentic Sprint Builder</h1>
+              <DashboardIdentitySummary
+                status={dashboardStatus}
+                loading={dashboardLoading}
+                agentModels={agentModels}
+                onAgentModelChange={(agentId, model) => setAgentModels((current) => ({ ...current, [agentId]: model }))}
+              />
             </div>
-            <div className="flex flex-wrap gap-3">
-              <Link href="/runs" className="rounded-2xl border border-slate-200 px-5 py-3 font-semibold hover:bg-slate-50">
+            <div className="flex w-full flex-col gap-2 md:w-auto md:min-w-80">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={createCompany}
+                  disabled={dashboardLoading}
+                  className="rounded-2xl border border-blue-200 px-4 py-2.5 font-semibold text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                >
+                  Create Company
+                </button>
+                <button
+                  onClick={() => setDeleteModalOpen(true)}
+                  disabled={dashboardLoading || !(dashboardStatus?.company_id || lastCompanyId)}
+                  className="rounded-2xl border border-red-200 px-4 py-2.5 font-semibold text-red-600 hover:bg-red-50 disabled:opacity-50"
+                >
+                  Delete Company
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={createAgents}
+                  disabled={dashboardLoading || !(dashboardStatus?.company_id || lastCompanyId)}
+                  className="rounded-2xl border border-emerald-200 px-4 py-2.5 font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                >
+                  Create Agents
+                </button>
+                <button
+                  onClick={deleteAgents}
+                  disabled={dashboardLoading || !dashboardStatus?.agents.some((agent) => agent.dashboard_agent_id)}
+                  className="rounded-2xl border border-amber-200 px-4 py-2.5 font-semibold text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                >
+                  Delete Agents
+                </button>
+              </div>
+              <Link href="/runs" className="rounded-2xl border border-slate-200 px-4 py-2.5 text-center font-semibold hover:bg-slate-50">
                 View Runs
               </Link>
-              <button onClick={() => setDeleteModalOpen(true)} className="rounded-2xl border border-red-200 px-5 py-3 font-semibold text-red-600 hover:bg-red-50">
-                Delete Company
-              </button>
             </div>
           </div>
         </section>
 
-        <section className="grid gap-6 lg:grid-cols-2">
-          <Editor title="requirements.md" value={requirements} onChange={setRequirements} />
-          <Editor title="tech-spec.md optional" value={techSpec} onChange={setTechSpec} />
+        <section className="grid gap-3 lg:grid-cols-2">
+          <MarkdownEditor title="requirements.md" expectedFileName="requirements.md" value={requirements} onChange={setRequirements} />
+          <MarkdownEditor title="tech-spec.md optional" expectedFileName="tech-spec.md" value={techSpec} onChange={setTechSpec} />
         </section>
 
         <RequirementImageInput images={requirementImages} onChange={setRequirementImages} />
 
-        <div className="flex items-center gap-4">
-          <button disabled={loading} onClick={runAgents} className="rounded-2xl bg-blue-600 px-6 py-3 font-semibold text-white shadow-sm hover:bg-blue-700 disabled:opacity-60">
+        <div className="flex flex-wrap items-center gap-3">
+          <button disabled={loading} onClick={runAgents} className="rounded-2xl bg-blue-600 px-5 py-2.5 font-semibold text-white shadow-sm hover:bg-blue-700 disabled:opacity-60">
             {loading ? 'Running AI Team...' : 'Run AI Team'}
           </button>
-          <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 hover:bg-slate-50">
+          <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 px-3 py-2.5 hover:bg-slate-50">
             <input
               type="checkbox"
               checked={cleanBeforeRun}
@@ -200,7 +291,7 @@ export default function HomePage() {
 
         {deleteModalOpen && (
           <DeleteCompanyModal
-            defaultCompanyId={lastCompanyId}
+            defaultCompanyId={dashboardStatus?.company_id || lastCompanyId}
             onDelete={deleteCompany}
             onClose={() => setDeleteModalOpen(false)}
           />
@@ -210,17 +301,115 @@ export default function HomePage() {
   );
 }
 
-function Editor(props: { title: string; value: string; onChange: (value: string) => void; placeholder?: string }) {
+function MarkdownEditor(props: { title: string; expectedFileName: string; value: string; onChange: (value: string) => void; placeholder?: string }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [loadedFileName, setLoadedFileName] = useState('');
+  const [uploadError, setUploadError] = useState('');
+
+  async function handleFileUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (inputRef.current) inputRef.current.value = '';
+    if (!file) return;
+
+    setUploadError('');
+    try {
+      const content = await readTextFile(file);
+      props.onChange(content);
+      setLoadedFileName(file.name);
+    } catch (error) {
+      setLoadedFileName('');
+      setUploadError(error instanceof Error ? error.message : `Failed to read ${file.name}`);
+    }
+  }
+
   return (
-    <label className="block rounded-3xl bg-white p-5 shadow-sm">
-      <span className="font-semibold">{props.title}</span>
+    <section className="rounded-3xl bg-white p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <span className="font-semibold">{props.title}</span>
+        <button
+          type="button"
+          onClick={() => inputRef.current?.click()}
+          className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50"
+        >
+          Upload {props.expectedFileName}
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".md,text/markdown,text/plain"
+          className="hidden"
+          onChange={handleFileUpload}
+        />
+      </div>
+      {(loadedFileName || uploadError) && (
+        <p className={`mt-2 text-xs ${uploadError ? 'text-red-600' : 'text-slate-500'}`}>
+          {uploadError || `Loaded ${loadedFileName}`}
+        </p>
+      )}
       <textarea
-        className="mt-3 h-80 w-full resize-y rounded-2xl border border-slate-200 bg-slate-50 p-4 font-mono text-sm"
+        className="mt-2 h-[24vh] min-h-[150px] max-h-64 w-full resize-y rounded-2xl border border-slate-200 bg-slate-50 p-3 font-mono text-sm"
         value={props.value}
         placeholder={props.placeholder}
+        aria-label={`${props.title} content`}
         onChange={(event) => props.onChange(event.target.value)}
       />
-    </label>
+    </section>
+  );
+}
+
+function DashboardIdentitySummary({
+  status,
+  loading,
+  agentModels,
+  onAgentModelChange
+}: {
+  status: DashboardStatus | null;
+  loading: boolean;
+  agentModels: AgentModelMap;
+  onAgentModelChange: (agentId: AgentId, model: string) => void;
+}) {
+  const createdAgents = status?.agents.filter((agent) => agent.dashboard_agent_id) ?? [];
+
+  return (
+    <div className="mt-2 space-y-2 text-sm">
+      <p className="font-mono text-slate-600">
+        Company ID: {status?.company_id ? <span className="font-semibold text-slate-900">{status.company_id}</span> : <span className="text-slate-400">Not created</span>}
+        {loading && <span className="ml-2 text-blue-600">Updating...</span>}
+      </p>
+      <div className="grid max-w-6xl grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
+        {(status?.agents ?? []).map((agent) => (
+          <span
+            key={agent.agent_id}
+            className={`grid max-w-full grid-cols-[minmax(0,1fr)_8.75rem] items-center gap-2 rounded-xl border px-3 py-1.5 font-mono text-xs ${
+              agent.dashboard_agent_id ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+          >
+            <span className="min-w-0">
+              <span className="block font-semibold">{agent.name}</span>
+              <span className="block truncate">{agent.dashboard_agent_id || 'not created'}</span>
+            </span>
+            <select
+              value={agentModels[agent.agent_id] || DEFAULT_AGENT_MODELS[agent.agent_id]}
+              onChange={(event) => onAgentModelChange(agent.agent_id, event.target.value)}
+              className="w-full rounded-lg border border-white/80 bg-white px-2 py-1 text-xs font-semibold text-slate-700 shadow-sm focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-100"
+              aria-label={`${agent.name} model`}
+            >
+              {AGENT_MODEL_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </span>
+        ))}
+        {!status?.agents?.length && <span className="text-slate-400">Agents: Not loaded</span>}
+      </div>
+      {createdAgents.length > 0 && (
+        <p className="text-xs text-slate-500">
+          Agents created: {createdAgents.length}/{status?.agents.length ?? 0}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -269,6 +458,15 @@ function readFileAsDataUrl(file: File): Promise<string> {
     reader.onload = () => resolve(reader.result as string);
     reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
     reader.readAsDataURL(file);
+  });
+}
+
+function readTextFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+    reader.readAsText(file);
   });
 }
 
@@ -329,18 +527,18 @@ function RequirementImageInput({ images, onChange }: { images: RequirementImage[
   }
 
   return (
-    <section className="rounded-3xl bg-white p-5 shadow-sm">
-      <div className="flex items-center justify-between">
+    <section className="rounded-3xl bg-white p-4 shadow-sm">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <span className="font-semibold">Requirement Images</span>
-          <span className="ml-2 text-sm text-slate-500">(UI mockups, wireframes, screenshots — max {MAX_IMAGES}, 5MB each)</span>
+          <span className="ml-2 text-xs text-slate-500">(mockups/screenshots - max {MAX_IMAGES}, 5MB each)</span>
         </div>
         <button
           type="button"
           onClick={() => inputRef.current?.click()}
           disabled={images.length >= MAX_IMAGES || isUploading}
           aria-label={isUploading ? 'Uploading images' : 'Add images'}
-          className="inline-flex min-w-[124px] items-center justify-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-40"
+          className="inline-flex min-w-[112px] items-center justify-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-40"
         >
           {isUploading ? (
             <span
@@ -361,22 +559,26 @@ function RequirementImageInput({ images, onChange }: { images: RequirementImage[
         />
       </div>
       {images.length > 0 && (
-        <div className="mt-4 flex flex-wrap gap-3">
+        <div className="mt-3 flex max-h-24 flex-col gap-1.5 overflow-y-auto pr-1">
           {images.map((image, index) => (
-            <div key={`${image.name}-${index}`} className="group relative">
+            <div key={`${image.name}-${index}`} className="group flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5">
               <img
                 src={image.dataUrl}
                 alt={image.name}
-                className="h-24 w-24 rounded-xl border border-slate-200 object-cover"
+                className="h-8 w-8 flex-none rounded-lg border border-slate-200 object-cover"
               />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-xs font-semibold text-slate-700">{image.name}</p>
+                <p className="text-[11px] text-slate-500">{Math.round(image.sizeBytes / 1024)} KB</p>
+              </div>
               <button
                 type="button"
                 onClick={() => removeImage(index)}
-                className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs text-white opacity-0 transition-opacity group-hover:opacity-100"
+                className="flex h-7 w-7 flex-none items-center justify-center rounded-full text-sm font-bold text-red-500 hover:bg-red-100"
+                aria-label={`Remove ${image.name}`}
               >
-                ×
+                X
               </button>
-              <p className="mt-1 max-w-[96px] truncate text-xs text-slate-500">{image.name}</p>
             </div>
           ))}
         </div>
@@ -411,16 +613,10 @@ function LiveRunStatus({
   onStop: () => void;
   onClose: () => void;
 }) {
-  const toneByStatus: Record<string, string> = {
-    PENDING: 'border-slate-200 bg-slate-50 text-slate-500',
-    RUNNING: 'border-blue-200 bg-blue-50 text-blue-700',
-    PASS: 'border-emerald-200 bg-emerald-50 text-emerald-700',
-    FAIL: 'border-red-200 bg-red-50 text-red-700',
-    SKIPPED: 'border-amber-200 bg-amber-50 text-amber-700'
-  };
   const runActive = status.status === 'QUEUED' || status.status === 'RUNNING';
   const frontendUrl = status.result ? getGeneratedFrontendUrl(status.result) : undefined;
   const logContainerRef = useRef<HTMLDivElement | null>(null);
+  const costLabel = status.result?.costSummary ? formatUsd(status.result.costSummary.totalUsd) : null;
 
   useEffect(() => {
     const logContainer = logContainerRef.current;
@@ -434,12 +630,13 @@ function LiveRunStatus({
   }, [status.logs.length, status.runId]);
 
   return (
-    <section className="bg-white p-6">
+    <section className="bg-white p-5">
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div>
-          <h2 className="text-2xl font-bold">Run progress</h2>
+          <h2 className="text-2xl font-bold">{status.result ? 'Run completed' : 'Terminal console'}</h2>
           <p className="mt-1 text-sm text-slate-500">
             {status.runId} - {status.status}
+            {costLabel ? ` - Cost ${costLabel}` : ''}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -459,7 +656,7 @@ function LiveRunStatus({
           )}
           {status.result && (
             <Link href={`/runs/${status.runId}`} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800">
-              Open run output
+              View Run
             </Link>
           )}
           <button onClick={onClose} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-bold text-slate-600 hover:bg-slate-50" aria-label="Close run progress">
@@ -468,15 +665,24 @@ function LiveRunStatus({
         </div>
       </div>
 
-      <div className="mt-5 flex flex-wrap gap-2">
-        {status.steps.map((step) => (
-          <div key={step.id} className={`rounded-2xl border px-3 py-2 text-sm font-semibold ${toneByStatus[step.status] || toneByStatus.PENDING}`}>
-            <span>{step.status}</span>
-            <span className="px-2 text-slate-300">|</span>
-            <span>{step.label}</span>
+      {status.result && (
+        <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+          <p className="text-sm font-bold text-emerald-800">Everything finished.</p>
+          <p className="mt-1 text-sm text-emerald-700">
+            Total AI cost: {costLabel || '$0.0000'} across {status.result.costSummary?.totalCalls ?? 0} model call(s).
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {frontendUrl && (
+              <a href={frontendUrl} target="_blank" rel="noreferrer" className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">
+                Open generated product
+              </a>
+            )}
+            <Link href={`/runs/${status.runId}`} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800">
+              View Run
+            </Link>
           </div>
-        ))}
-      </div>
+        </div>
+      )}
 
       <div ref={logContainerRef} className="mt-5 max-h-[50vh] overflow-auto rounded-2xl bg-slate-950 p-4 font-mono text-xs text-slate-100">
         {status.logs.length === 0 ? (
@@ -505,6 +711,10 @@ function getGeneratedFrontendUrl(result: RunResult) {
   return firstUrl(frontendHealth?.message) || firstUrl(frontendHealth?.command);
 }
 
+function formatUsd(value: number) {
+  return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
+}
+
 function ProgressDock({ status, onOpen }: { status: RunStatusSnapshot; onOpen: () => void }) {
   return (
     <div className="fixed bottom-5 left-5 z-40 flex items-center gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-lg">
@@ -518,6 +728,7 @@ function ProgressDock({ status, onOpen }: { status: RunStatusSnapshot; onOpen: (
 
 function CompletionDock({ result, onOpenProgress }: { result: RunResult; onOpenProgress: () => void }) {
   const frontendUrl = getGeneratedFrontendUrl(result);
+  const costLabel = result.costSummary ? formatUsd(result.costSummary.totalUsd) : '$0.0000';
 
   return (
     <div className="fixed bottom-5 left-5 z-40 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-lg">
@@ -527,10 +738,11 @@ function CompletionDock({ result, onOpenProgress }: { result: RunResult; onOpenP
         </a>
       )}
       <Link href={`/runs/${result.runId}`} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800">
-        Progress detail
+        View Run
       </Link>
+      <span className="px-2 text-xs font-semibold text-slate-500">Cost {costLabel}</span>
       <button onClick={onOpenProgress} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-        Show popup
+        Show dialog
       </button>
     </div>
   );
@@ -603,9 +815,13 @@ function RunResultView({ result }: { result: RunResult }) {
         <h2 className="text-2xl font-bold">Run completed</h2>
         <p className="mt-1 text-sm text-slate-500">Run ID: {result.runId}</p>
         <p className="mt-1 text-sm font-semibold text-slate-700">QA Status: {result.qaStatus || 'Not recorded'}</p>
+        <p className="mt-1 text-sm text-slate-500">Code review fix iterations: {result.codeReviewFixIterations ?? 0}</p>
+        <p className="mt-1 text-sm text-slate-500">DevOps fix iterations: {result.deployFixIterations ?? 0}</p>
         <p className="mt-1 text-sm text-slate-500">Build readiness fix iterations: {result.buildReadinessFixIterations ?? 0}</p>
         <p className="mt-1 text-sm text-slate-500">QA fix iterations: {result.qaFixIterations ?? 0}</p>
         <p className="mt-1 text-sm text-slate-500">Execution validation fixes: {result.executionValidationFixIterations ?? 0}</p>
+        <p className="mt-1 text-sm font-semibold text-slate-700">AI cost: {result.costSummary ? formatUsd(result.costSummary.totalUsd) : '$0.0000'}</p>
+        <p className="mt-1 text-sm text-slate-500">Free image candidates: {result.freeImageCandidates?.length ?? 0}</p>
         <p className="mt-1 text-sm text-slate-500">Artifacts: {result.outputDir}</p>
         <p className="mt-1 text-sm text-slate-500">Generated code: {result.codeOutputDir}</p>
         <ExecutionValidationStatus result={result} />
@@ -632,12 +848,49 @@ function RunResultView({ result }: { result: RunResult }) {
       </div>
 
       <Artifact title="BA Artifacts" content={result.baOutput} />
+      {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
+      {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
       <Artifact title="Architecture" content={result.devOutput.architecture} />
       <Artifact title="Generated Files" content={result.devOutput.files.map((file) => `### ${file.path}\n\n\`\`\`\n${file.content}\n\`\`\``).join('\n\n')} />
       <Artifact title="Setup Instructions" content={result.devOutput.setupInstructions} />
+      {result.freeImageCandidates?.length ? <Artifact title="Free Image Candidates" content={formatFreeImageCandidates(result.freeImageCandidates)} /> : null}
       <Artifact title="QA Report" content={result.qaOutput} />
     </section>
   );
+}
+
+function formatFreeImageCandidates(candidates: NonNullable<RunResult['freeImageCandidates']>) {
+  return candidates
+    .map(
+      (candidate, index) => `### ${index + 1}. ${candidate.title}
+
+- Query: ${candidate.query}
+- Image URL: ${candidate.imageUrl}
+- Source page: ${candidate.pageUrl}
+- License: ${candidate.license}${candidate.licenseUrl ? `\n- License URL: ${candidate.licenseUrl}` : ''}
+`
+    )
+    .join('\n');
+}
+
+function formatAgentModels(models: AgentModelMap) {
+  return Object.entries(models)
+    .map(([agentId, model]) => `- ${agentId}: ${model}`)
+    .join('\n');
+}
+
+function formatCostSummary(summary: NonNullable<RunResult['costSummary']>) {
+  return [
+    `Total: ${formatUsd(summary.totalUsd)}`,
+    `Calls: ${summary.totalCalls}`,
+    `Tokens: ${summary.totalTokens} total (${summary.promptTokens} prompt, ${summary.completionTokens} completion)`,
+    '',
+    '## By Agent',
+    ...summary.byAgent.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`),
+    '',
+    '## By Model',
+    ...summary.byModel.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`)
+  ].join('\n');
 }
 
 function ExecutionValidationStatus({ result }: { result: RunResult }) {

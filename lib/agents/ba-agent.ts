@@ -1,11 +1,31 @@
 import { runMarkdownSkillAgent } from './base-agent';
 import { formatGeneratedCodeContext, formatRunHistoryContext } from '@/lib/context/agent-context';
-import type { GeneratedFile, RequirementImage, RunResult } from '@/lib/types';
+import type { FreeImageCandidate, GeneratedFile, RequirementImage, RunResult } from '@/lib/types';
+
+function formatFreeImageCandidates(candidates?: FreeImageCandidate[]) {
+  if (!candidates?.length) {
+    return 'No free/safe remote image candidates were found for this requirement. If imagery is needed, ask DEV to use neutral CSS/placeholders rather than unsafe hotlinks.';
+  }
+
+  return candidates
+    .map((candidate, index) => {
+      const thumb = candidate.thumbUrl ? `\n  Thumb: ${candidate.thumbUrl}` : '';
+      const licenseUrl = candidate.licenseUrl ? `\n  License URL: ${candidate.licenseUrl}` : '';
+      return `${index + 1}. ${candidate.title}
+  Query: ${candidate.query}
+  Image URL: ${candidate.imageUrl}
+  Source page: ${candidate.pageUrl}
+  License: ${candidate.license}${licenseUrl}${thumb}`;
+    })
+    .join('\n');
+}
 
 export async function runBAAgent(input: {
   requirements: string;
   techSpec?: string | null;
   requirementImages?: RequirementImage[] | null;
+  freeImageCandidates?: FreeImageCandidate[];
+  modelOverride?: string;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
   signal?: AbortSignal;
@@ -19,6 +39,7 @@ export async function runBAAgent(input: {
 
   return runMarkdownSkillAgent({
     agentId: 'ba',
+    modelOverride: input.modelOverride,
     signal: input.signal,
     images: input.requirementImages ?? undefined,
     userPrompt: `
@@ -31,6 +52,11 @@ ${input.requirements}
 TECH SPEC:
 ${techSpec}
 ${imageContext}
+
+FREE/SAFE IMAGE CANDIDATES:
+${formatFreeImageCandidates(input.freeImageCandidates)}
+
+When image candidates are relevant, choose image URLs that are visually close to the provided UI mockups or expected product imagery. Include selected URLs in Frontend Visual Design Contract > Media And Product Imagery and DEV Implementation Notes with source/license notes. If none are relevant, say so and direct DEV to use neutral placeholders.
 
 EXISTING GENERATED CODE:
 ${existingCodeContext}

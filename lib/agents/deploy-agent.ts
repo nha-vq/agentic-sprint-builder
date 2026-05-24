@@ -109,6 +109,7 @@ export async function runDeployAgent(input: {
   devOutput: DevOutput;
   preparedTechStack?: PreparedTechStackOutput;
   existingFiles?: GeneratedFile[];
+  modelOverride?: string;
   signal?: AbortSignal;
 }): Promise<DeployOutput> {
   const files = input.existingFiles ?? input.devOutput.files;
@@ -118,6 +119,7 @@ export async function runDeployAgent(input: {
 
   const raw = await runMarkdownSkillAgent({
     agentId: 'deploy',
+    modelOverride: input.modelOverride,
     fallbackTemperature: 0.1,
     maxTokens: 16_384,
     signal: input.signal,
@@ -146,7 +148,7 @@ ${deploymentFiles || 'No deployment files found'}
 PACKAGE MANIFESTS:
 ${packageManifests || 'No package manifests found'}
 
-Validate: Docker Compose configuration, Dockerfile correctness, port mappings, environment variables, healthchecks, startup commands, volume mounts, and overall deployment readiness.
+Validate: Docker Compose configuration, Dockerfile correctness, Dockerfile COPY sources against the generated file tree, port mappings, environment variables, healthchecks, startup commands, volume mounts, frontend build readiness signals, and overall deployment readiness.
 Return JSON only.
 `
   });

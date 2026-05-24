@@ -6,6 +6,7 @@ export async function runMarkdownSkillAgent(params: {
   agentId: AgentId;
   userPrompt: string;
   images?: RequirementImage[];
+  modelOverride?: string;
   fallbackModel?: string;
   fallbackTemperature?: number;
   maxTokens?: number;
@@ -23,7 +24,8 @@ export async function runMarkdownSkillAgent(params: {
     system,
     user: params.userPrompt,
     images: params.images,
-    model: skill.meta.model || params.fallbackModel,
+    agentId: params.agentId,
+    model: params.modelOverride || skill.meta.model || params.fallbackModel,
     temperature: skill.meta.temperature ?? params.fallbackTemperature ?? 0.2,
     maxTokens: params.maxTokens,
     signal: params.signal,

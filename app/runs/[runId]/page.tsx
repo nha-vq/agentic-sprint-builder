@@ -21,9 +21,13 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
                 {result.topic} · {new Date(result.createdAt).toLocaleString()}
               </p>
               <p className="mt-2 text-sm font-semibold text-slate-700">QA Status: {result.qaStatus || 'Not recorded'}</p>
+              <p className="mt-1 text-sm text-slate-500">Code review fix iterations: {result.codeReviewFixIterations ?? 0}</p>
+              <p className="mt-1 text-sm text-slate-500">DevOps fix iterations: {result.deployFixIterations ?? 0}</p>
               <p className="mt-1 text-sm text-slate-500">Build readiness fix iterations: {result.buildReadinessFixIterations ?? 0}</p>
               <p className="mt-1 text-sm text-slate-500">QA fix iterations: {result.qaFixIterations ?? 0}</p>
               <p className="mt-1 text-sm text-slate-500">Execution validation fixes: {result.executionValidationFixIterations ?? 0}</p>
+              <p className="mt-1 text-sm font-semibold text-slate-700">AI cost: {result.costSummary ? formatUsd(result.costSummary.totalUsd) : '$0.0000'}</p>
+              <p className="mt-1 text-sm text-slate-500">Free image candidates: {result.freeImageCandidates?.length ?? 0}</p>
               <p className="mt-2 text-sm text-slate-500">Artifacts: {result.outputDir}</p>
               <p className="mt-1 text-sm text-slate-500">Generated code: {result.codeOutputDir}</p>
               <ExecutionValidationStatus result={result} />
@@ -59,6 +63,8 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
         </section>
 
         <Artifact title="BA Artifacts" content={result.baOutput} />
+        {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
+        {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
         <Artifact title="Architecture" content={result.devOutput.architecture} />
         <Artifact
           title="Generated Files"
@@ -68,6 +74,7 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
         {result.executionValidation && (
           <Artifact title="Execution Validation" content={JSON.stringify(result.executionValidation, null, 2)} />
         )}
+        {result.freeImageCandidates?.length ? <Artifact title="Free Image Candidates" content={formatFreeImageCandidates(result.freeImageCandidates)} /> : null}
         <Artifact title="QA Report" content={result.qaOutput} />
       </div>
     </main>
@@ -84,6 +91,44 @@ function getGeneratedFrontendUrl(result: NonNullable<Awaited<ReturnType<typeof r
 
   const frontendHealth = result.executionValidation?.steps.find((step) => step.name.toLowerCase().includes('frontend') && step.status === 'PASS');
   return firstUrl(frontendHealth?.message) || firstUrl(frontendHealth?.command);
+}
+
+function formatUsd(value: number) {
+  return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
+}
+
+function formatFreeImageCandidates(candidates: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['freeImageCandidates']>) {
+  return candidates
+    .map(
+      (candidate, index) => `### ${index + 1}. ${candidate.title}
+
+- Query: ${candidate.query}
+- Image URL: ${candidate.imageUrl}
+- Source page: ${candidate.pageUrl}
+- License: ${candidate.license}${candidate.licenseUrl ? `\n- License URL: ${candidate.licenseUrl}` : ''}
+`
+    )
+    .join('\n');
+}
+
+function formatAgentModels(models: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['agentModels']>) {
+  return Object.entries(models)
+    .map(([agentId, model]) => `- ${agentId}: ${model}`)
+    .join('\n');
+}
+
+function formatCostSummary(summary: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['costSummary']>) {
+  return [
+    `Total: ${formatUsd(summary.totalUsd)}`,
+    `Calls: ${summary.totalCalls}`,
+    `Tokens: ${summary.totalTokens} total (${summary.promptTokens} prompt, ${summary.completionTokens} completion)`,
+    '',
+    '## By Agent',
+    ...summary.byAgent.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`),
+    '',
+    '## By Model',
+    ...summary.byModel.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`)
+  ].join('\n');
 }
 
 function ExecutionValidationStatus({ result }: { result: Awaited<ReturnType<typeof readRunResult>> }) {

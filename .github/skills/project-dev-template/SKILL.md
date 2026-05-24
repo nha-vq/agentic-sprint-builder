@@ -66,6 +66,13 @@ This section is produced by the prepare-tech-stack flow and is the source of tru
 ## Component And Source Conventions
 {{CONVENTIONS}}
 
+## Specialized DEV Ownership
+- DEV Lead owns planning, file ownership, cross-service contracts, and final integration.
+- Frontend DEV owns frontend routes, components, styles, browser API clients, visual fidelity, and App Router client/server correctness.
+- Backend DEV owns APIs, models, persistence, seed data, health endpoints, CORS, and backend runtime behavior.
+- Integration DEV owns Dockerfiles, Compose, env examples, README commands, service ports, health checks, and frontend/backend wiring.
+- During repairs, keep changes inside the smallest ownership area proven by the validation log.
+
 ## Visual Fidelity Rules
 - Preserve the current frontend visual direction captured in the BA Frontend Visual Design Contract unless a later user request explicitly changes it.
 - For future frontend changes, map each visual requirement to concrete pages, components, styling/theme files, and seed media choices before generating files.
@@ -90,6 +97,12 @@ This section is produced by the prepare-tech-stack flow and is the source of tru
 - Do not patch files under generated-code as a one-off workaround outside the multi-agent flow.
 - Repairs must be produced through the DEV agent and written by the orchestrator.
 - Do not edit generated validation workspaces except as temporary build artifacts.
+
+## Recurring Build Lessons
+- In App Router projects, components importing client-only UI libraries such as `react-icons`, using hooks, browser APIs, event handlers, or client navigation must begin with `'use client';`.
+- Do not import `next/document` from `app/` files or shared components.
+- Dockerfile `COPY --from=builder` sources must exist in the builder output. Do not copy `/app/public` unless the generated frontend includes a `public/` directory/file.
+- Browser-facing API URLs must be reachable from the user's browser; Compose-only service DNS such as `http://backend:8000` is not valid for client-side code unless a browser-reachable proxy is generated.
 
 ## Future Feature Rules
 - Load this skill before planning future DEV work for this project.

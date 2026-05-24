@@ -79,6 +79,7 @@ export async function runCodeReviewAgent(input: {
   devOutput: DevOutput;
   preparedTechStack?: PreparedTechStackOutput;
   existingFiles?: GeneratedFile[];
+  modelOverride?: string;
   signal?: AbortSignal;
 }): Promise<CodeReviewOutput> {
   const projectOverview = formatGeneratedProjectOverview(input.existingFiles ?? input.devOutput.files);
@@ -88,6 +89,7 @@ export async function runCodeReviewAgent(input: {
 
   const raw = await runMarkdownSkillAgent({
     agentId: 'code-review',
+    modelOverride: input.modelOverride,
     fallbackTemperature: 0.2,
     maxTokens: 16_384,
     signal: input.signal,
@@ -120,7 +122,7 @@ ${truncate(input.devOutput.architecture, 2_000)}
 GENERATED FILES:
 ${truncate(fileList, 60_000)}
 
-Review for: architecture consistency, requirement coverage, visual design contract coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, and security basics.
+Review for: architecture consistency, requirement coverage, visual design contract coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, security basics, Next.js App Router client/server boundaries, and Dockerfile COPY sources that do not exist in the generated project.
 If requirement images are attached, use them only for source-level visual coverage review. Do not require screenshot or pixel-diff evidence, but flag obvious missing mockup-driven layout/style/component requirements from frontend files as requirement blockers.
 Return JSON only.
 `

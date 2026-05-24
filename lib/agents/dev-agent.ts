@@ -5,7 +5,17 @@ import { RUN_LIMITS } from '@/lib/config/limits';
 import { extractJsonObject } from '@/lib/utils/json';
 import { formatRepairScope } from '@/lib/validation/repair-scope';
 import type { ProjectDevSkill } from '@/lib/skills/project-dev-skill';
-import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RepairScope, RequirementImage, RunProgressReporter, RunResult } from '@/lib/types';
+import type { AgentId, DashboardEventType, DevOutput, FreeImageCandidate, GeneratedFile, PreparedTechStackOutput, RepairScope, RequirementImage, RunProgressReporter, RunResult } from '@/lib/types';
+
+type DevWorkerAgentId = Extract<AgentId, 'dev' | 'frontend-dev' | 'backend-dev' | 'integration-dev'>;
+
+type DevAgentActivityReporter = (activity: {
+  agentId: AgentId;
+  eventType: DashboardEventType;
+  task: string;
+  toAgent?: AgentId;
+  artifact?: string;
+}) => void | Promise<void>;
 
 const GeneratedFileSchema = z.object({
   path: z.string().min(1).max(240),
@@ -136,6 +146,28 @@ ${imageList}
 Use these images together with the BA Frontend Visual Design Contract. For frontend visual files, inspect the attached images directly before deciding layout, styling, component composition, product imagery treatment, spacing, typography, and responsive behavior. Reproduce visible in-scope UI and static placeholders needed for visual fidelity, but do not add backend workflows for out-of-scope mockup features.`;
 }
 
+function formatFreeImageCandidateContext(candidates?: FreeImageCandidate[] | null) {
+  if (!candidates?.length) {
+    return 'No free/safe remote image candidates were provided. Use neutral CSS or local placeholder treatment instead of unsafe hotlinks.';
+  }
+
+  const imageList = candidates
+    .map((candidate, index) => {
+      const thumb = candidate.thumbUrl ? `\n  Thumb: ${candidate.thumbUrl}` : '';
+      const licenseUrl = candidate.licenseUrl ? `\n  License URL: ${candidate.licenseUrl}` : '';
+      return `${index + 1}. ${candidate.title}
+  Query: ${candidate.query}
+  Image URL: ${candidate.imageUrl}
+  Source page: ${candidate.pageUrl}
+  License: ${candidate.license}${licenseUrl}${thumb}`;
+    })
+    .join('\n');
+
+  return `Free/safe remote image candidates are available for generated product/media imagery.
+Use only candidates that fit the BA Frontend Visual Design Contract and the mockup subject/style. Prefer the direct Image URL for display and include source/license notes in README Visual Fidelity Notes. Do not use unrelated imagery just because it is available.
+${imageList}`;
+}
+
 function hasRequirementImages(images?: RequirementImage[] | null) {
   return (images?.length ?? 0) > 0;
 }
@@ -193,6 +225,78 @@ function normalizeGeneratedPath(filePath: string) {
 function basename(filePath: string) {
   const normalized = filePath.replace(/\\/g, '/');
   return normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase();
+}
+
+function devWorkerLabel(agentId: DevWorkerAgentId) {
+  if (agentId === 'frontend-dev') return 'Frontend DEV';
+  if (agentId === 'backend-dev') return 'Backend DEV';
+  if (agentId === 'integration-dev') return 'Integration DEV';
+  return 'DEV Lead';
+}
+
+function devWorkerForPath(filePath: string): DevWorkerAgentId {
+  const normalized = normalizeGeneratedPath(filePath);
+  const name = basename(normalized);
+
+  if (
+    name === 'dockerfile' ||
+    name === 'containerfile' ||
+    /(^|\/)(compose|docker-compose)\.ya?ml$/i.test(normalized) ||
+    /(^|\/)(\.env\.example|\.env|readme\.md)$/i.test(normalized) ||
+    /(^|\/)(next|vite|webpack|turbo|postcss|tailwind)\.config\.(js|ts|mjs|cjs)$/i.test(normalized)
+  ) {
+    return 'integration-dev';
+  }
+
+  if (normalized.startsWith('frontend/')) return 'frontend-dev';
+
+  if (
+    normalized.startsWith('backend/') ||
+    normalized.startsWith('database/') ||
+    normalized.startsWith('db/') ||
+    /(^|\/)(migrations?|schema|seed|initdb)\//i.test(normalized)
+  ) {
+    return 'backend-dev';
+  }
+
+  return 'integration-dev';
+}
+
+function modelForDevWorker(agentId: DevWorkerAgentId, input: { modelOverride?: string; agentModelOverrides?: Partial<Record<AgentId, string>> }) {
+  return input.agentModelOverrides?.[agentId] || (agentId === 'dev' ? input.modelOverride : undefined) || input.modelOverride;
+}
+
+function workerSystemAppend(agentId: DevWorkerAgentId, baseAppend: string) {
+  const role =
+    agentId === 'frontend-dev'
+      ? `## Current Worker Role
+You are the Frontend DEV. Own only frontend application files, shared UI components, styling, browser-side API calls, visual fidelity, responsive layout, and client/server component correctness. In App Router projects, any component that imports client-only UI libraries such as react-icons, uses hooks, browser APIs, event handlers, or next/navigation client hooks must begin with 'use client'. Never import next/document from app/ files or components.`
+      : agentId === 'backend-dev'
+      ? `## Current Worker Role
+You are the Backend DEV. Own only backend API files, data models, persistence, validation, seed data, CORS, health checks, and backend dependency/runtime files. Keep API response shapes aligned with the frontend contract and seed enough representative data for local smoke testing.`
+      : agentId === 'integration-dev'
+      ? `## Current Worker Role
+You are the Integration DEV. Own Dockerfiles, Compose, env examples, README run instructions, service wiring, ports, health checks, and frontend/backend integration contracts. Every Dockerfile COPY source must exist inside that build stage/context. Do not copy /app/public unless a public directory is generated. Browser-facing API URLs must be reachable from the browser, not only from Compose service DNS.`
+      : `## Current Worker Role
+You are the DEV Lead. Own implementation planning, file ownership, architecture consistency, and final integration across specialized DEV workers.`;
+
+  return [baseAppend, role].filter(Boolean).join('\n\n');
+}
+
+function buildWorkerBatches(manifestFiles: DevManifest['files'], batchSize: number) {
+  const batches: Array<{ agentId: DevWorkerAgentId; files: DevManifest['files'] }> = [];
+
+  for (const file of manifestFiles) {
+    const agentId = devWorkerForPath(file.path);
+    const lastBatch = batches[batches.length - 1];
+    if (lastBatch && lastBatch.agentId === agentId && lastBatch.files.length < batchSize) {
+      lastBatch.files.push(file);
+    } else {
+      batches.push({ agentId, files: [file] });
+    }
+  }
+
+  return batches;
 }
 
 function orderedUnique(paths: string[]) {
@@ -351,6 +455,7 @@ function buildDevContext(input: {
   requirements: string;
   techSpec: string;
   requirementImages?: RequirementImage[] | null;
+  freeImageCandidates?: FreeImageCandidate[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingCode: string;
@@ -384,6 +489,9 @@ ${input.techSpec}
 
 REQUIREMENT IMAGE CONTEXT:
 ${formatRequirementImageContext(input.requirementImages)}
+
+FREE/SAFE IMAGE CANDIDATES:
+${formatFreeImageCandidateContext(input.freeImageCandidates)}
 
 PREPARED TECH STACK (SOURCE OF TRUTH WHEN PRESENT):
 ${input.preparedTechStack ? JSON.stringify(input.preparedTechStack, null, 2) : 'Not prepared. If this is first generation, report this as a workflow issue and use safe skill defaults only when instructed by the orchestrator.'}
@@ -425,6 +533,7 @@ async function requestDevManifest(params: {
   projectDevSkill?: ProjectDevSkill | null;
   preparedTechStack?: PreparedTechStackOutput;
   enrichedSkillContext?: string;
+  modelOverride?: string;
   repairScope?: RepairScope;
   onProgress?: RunProgressReporter;
   signal?: AbortSignal;
@@ -435,6 +544,7 @@ async function requestDevManifest(params: {
     try {
       const manifestRaw = await runMarkdownSkillAgent({
         agentId: 'dev',
+        modelOverride: params.modelOverride,
         fallbackTemperature: 0.1,
         maxTokens: attempt === 1 ? 8_192 : 12_288,
         systemAppend: buildDevSystemAppend({
@@ -484,6 +594,7 @@ function buildBatchFileContext(input: {
   requirements: string;
   techSpec: string;
   requirementImages?: RequirementImage[] | null;
+  freeImageCandidates?: FreeImageCandidate[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   qaFeedback: string;
@@ -532,6 +643,9 @@ ${truncate(input.techSpec, 3_000)}
 
 REQUIREMENT IMAGE CONTEXT:
 ${formatRequirementImageContext(input.requirementImages)}
+
+FREE/SAFE IMAGE CANDIDATES:
+${formatFreeImageCandidateContext(input.freeImageCandidates)}
 
 PREPARED TECH STACK EXCERPT:
 ${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), 6_000) : 'Not prepared.'}
@@ -587,6 +701,7 @@ async function requestGeneratedFile(params: {
     requirements: string;
     techSpec: string;
     requirementImages?: RequirementImage[];
+    freeImageCandidates?: FreeImageCandidate[];
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -594,6 +709,9 @@ async function requestGeneratedFile(params: {
     repairScope?: RepairScope;
     projectDevSkill?: ProjectDevSkill | null;
     enrichedSkillContext?: string;
+    modelOverride?: string;
+    agentModelOverrides?: Partial<Record<AgentId, string>>;
+    workerAgentId?: DevWorkerAgentId;
     onProgress?: RunProgressReporter;
     signal?: AbortSignal;
   };
@@ -605,6 +723,7 @@ async function requestGeneratedFile(params: {
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
     requirementImages: attachedImages,
+    freeImageCandidates: params.input.freeImageCandidates,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -619,14 +738,18 @@ async function requestGeneratedFile(params: {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       const fileRaw = await runMarkdownSkillAgent({
-        agentId: 'dev',
+        agentId: params.input.workerAgentId || 'dev',
+        modelOverride: modelForDevWorker(params.input.workerAgentId || 'dev', params.input),
         fallbackTemperature: 0.1,
         maxTokens: attempt === 1 ? 32_768 : 65_536,
-        systemAppend: buildDevSystemAppend({
-          projectDevSkill: params.input.projectDevSkill,
-          preparedTechStack: params.input.preparedTechStack,
-          enrichedSkillContext: params.input.enrichedSkillContext
-        }),
+        systemAppend: workerSystemAppend(
+          params.input.workerAgentId || 'dev',
+          buildDevSystemAppend({
+            projectDevSkill: params.input.projectDevSkill,
+            preparedTechStack: params.input.preparedTechStack,
+            enrichedSkillContext: params.input.enrichedSkillContext
+          })
+        ),
         jsonSchema: {
           name: 'generated_file',
           schema: GeneratedFileJsonSchema
@@ -665,26 +788,32 @@ ${batchContext}
     } catch (error) {
       lastError = error;
       const oversized = isOversizedGeneratedFileError(error);
+      const workerAgentId = params.input.workerAgentId || 'dev';
+      const workerLabel = devWorkerLabel(workerAgentId);
       await params.input.onProgress?.({
-        stepId: 'dev',
+        stepId: workerAgentId,
         stepStatus: 'RUNNING',
         level: 'warn',
         message: oversized
-          ? `DEV retrying ${params.manifestFile.path}; generated file was too large (${error.bytes}/${error.limit} bytes) on attempt ${attempt}.`
-          : `DEV retrying ${params.manifestFile.path}; ${isTruncationError(error) ? 'response was truncated' : 'provider returned invalid JSON'} on attempt ${attempt}.`
+          ? `${workerLabel} retrying ${params.manifestFile.path}; generated file was too large (${error.bytes}/${error.limit} bytes) on attempt ${attempt}.`
+          : `${workerLabel} retrying ${params.manifestFile.path}; ${isTruncationError(error) ? 'response was truncated' : 'provider returned invalid JSON'} on attempt ${attempt}.`
       });
     }
   }
 
   const rawFallback = await runMarkdownSkillAgent({
-    agentId: 'dev',
+    agentId: params.input.workerAgentId || 'dev',
+    modelOverride: modelForDevWorker(params.input.workerAgentId || 'dev', params.input),
     fallbackTemperature: 0.1,
     maxTokens: 65_536,
-    systemAppend: buildDevSystemAppend({
-      projectDevSkill: params.input.projectDevSkill,
-      preparedTechStack: params.input.preparedTechStack,
-      enrichedSkillContext: params.input.enrichedSkillContext
-    }),
+    systemAppend: workerSystemAppend(
+      params.input.workerAgentId || 'dev',
+      buildDevSystemAppend({
+        projectDevSkill: params.input.projectDevSkill,
+        preparedTechStack: params.input.preparedTechStack,
+        enrichedSkillContext: params.input.enrichedSkillContext
+      })
+    ),
     signal: params.input.signal,
     images: attachedImages,
     userPrompt: `
@@ -723,6 +852,7 @@ async function requestGeneratedFileBatch(params: {
     requirements: string;
     techSpec: string;
     requirementImages?: RequirementImage[];
+    freeImageCandidates?: FreeImageCandidate[];
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -730,6 +860,9 @@ async function requestGeneratedFileBatch(params: {
     repairScope?: RepairScope;
     projectDevSkill?: ProjectDevSkill | null;
     enrichedSkillContext?: string;
+    modelOverride?: string;
+    agentModelOverrides?: Partial<Record<AgentId, string>>;
+    workerAgentId?: DevWorkerAgentId;
     onProgress?: RunProgressReporter;
     signal?: AbortSignal;
   };
@@ -753,6 +886,7 @@ async function requestGeneratedFileBatch(params: {
     requirements: params.input.requirements,
     techSpec: params.input.techSpec,
     requirementImages: attachedImages,
+    freeImageCandidates: params.input.freeImageCandidates,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -765,14 +899,18 @@ async function requestGeneratedFileBatch(params: {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       const batchRaw = await runMarkdownSkillAgent({
-        agentId: 'dev',
+        agentId: params.input.workerAgentId || 'dev',
+        modelOverride: modelForDevWorker(params.input.workerAgentId || 'dev', params.input),
         fallbackTemperature: 0.1,
         maxTokens: 65_536,
-        systemAppend: buildDevSystemAppend({
-          projectDevSkill: params.input.projectDevSkill,
-          preparedTechStack: params.input.preparedTechStack,
-          enrichedSkillContext: params.input.enrichedSkillContext
-        }),
+        systemAppend: workerSystemAppend(
+          params.input.workerAgentId || 'dev',
+          buildDevSystemAppend({
+            projectDevSkill: params.input.projectDevSkill,
+            preparedTechStack: params.input.preparedTechStack,
+            enrichedSkillContext: params.input.enrichedSkillContext
+          })
+        ),
         jsonSchema: {
           name: 'generated_file_batch',
           schema: GeneratedFileBatchJsonSchema
@@ -806,15 +944,17 @@ ${batchContext}
     } catch (error) {
       const truncated = isTruncationError(error);
       const oversized = isOversizedGeneratedFileError(error);
+      const workerAgentId = params.input.workerAgentId || 'dev';
+      const workerLabel = devWorkerLabel(workerAgentId);
       await params.input.onProgress?.({
-        stepId: 'dev',
+        stepId: workerAgentId,
         stepStatus: 'RUNNING',
         level: 'warn',
         message: oversized
-          ? `DEV batch produced oversized ${error.filePath} (${error.bytes}/${error.limit} bytes); splitting into smaller batches.`
+          ? `${workerLabel} batch produced oversized ${error.filePath} (${error.bytes}/${error.limit} bytes); splitting into smaller batches.`
           : truncated
-          ? `DEV batch response was truncated for ${paths.join(', ')}; splitting into smaller batches.`
-          : `DEV retrying batch ${paths.join(', ')}; provider returned invalid JSON on attempt ${attempt}.`
+          ? `${workerLabel} batch response was truncated for ${paths.join(', ')}; splitting into smaller batches.`
+          : `${workerLabel} retrying batch ${paths.join(', ')}; provider returned invalid JSON on attempt ${attempt}.`
       });
 
       if (truncated || oversized) break;
@@ -824,11 +964,12 @@ ${batchContext}
   const midpoint = Math.ceil(params.manifestFiles.length / 2);
   const left = params.manifestFiles.slice(0, midpoint);
   const right = params.manifestFiles.slice(midpoint);
+  const workerAgentId = params.input.workerAgentId || 'dev';
   await params.input.onProgress?.({
-    stepId: 'dev',
+    stepId: workerAgentId,
     stepStatus: 'RUNNING',
     level: 'warn',
-    message: `DEV splitting batch into ${left.length} + ${right.length} file(s) after batch failure.`
+    message: `${devWorkerLabel(workerAgentId)} splitting batch into ${left.length} + ${right.length} file(s) after batch failure.`
   });
 
   return [
@@ -841,6 +982,7 @@ export async function runDevAgent(input: {
   requirements: string;
   techSpec?: string | null;
   requirementImages?: RequirementImage[] | null;
+  freeImageCandidates?: FreeImageCandidate[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingFiles?: GeneratedFile[];
@@ -850,8 +992,11 @@ export async function runDevAgent(input: {
   repairScope?: RepairScope;
   projectDevSkill?: ProjectDevSkill | null;
   enrichedSkillContext?: string;
+  modelOverride?: string;
+  agentModelOverrides?: Partial<Record<AgentId, string>>;
   apiSpec?: string;
   onProgress?: RunProgressReporter;
+  onAgentActivity?: DevAgentActivityReporter;
   signal?: AbortSignal;
 }): Promise<DevOutput> {
   const techSpec = input.techSpec?.trim() || 'Not provided';
@@ -880,6 +1025,15 @@ export async function runDevAgent(input: {
     });
   }
 
+  if (input.freeImageCandidates?.length) {
+    await input.onProgress?.({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      level: 'info',
+      message: `DEV received ${input.freeImageCandidates.length} free/safe image candidate(s) for generated product imagery.`
+    });
+  }
+
   if (input.repairScope && (input.existingFiles?.length ?? 0) > 0) {
     await input.onProgress?.({
       stepId: 'dev',
@@ -892,6 +1046,7 @@ export async function runDevAgent(input: {
     requirements: input.requirements,
     techSpec,
     requirementImages: input.requirementImages,
+    freeImageCandidates: input.freeImageCandidates,
     preparedTechStack: input.preparedTechStack,
     baOutput: input.baOutput,
     existingCode,
@@ -931,6 +1086,7 @@ export async function runDevAgent(input: {
       projectDevSkill: input.projectDevSkill,
       preparedTechStack: input.preparedTechStack,
       enrichedSkillContext: input.enrichedSkillContext,
+      modelOverride: input.agentModelOverrides?.dev || input.modelOverride,
       signal: input.signal
     });
   }
@@ -947,15 +1103,28 @@ export async function runDevAgent(input: {
 
   const files: GeneratedFile[] = [];
   const batchSize = input.repairScope && manifest.files.length <= 2 ? manifest.files.length || 1 : getDevFileBatchSize();
-  for (let index = 0; index < manifest.files.length; index += batchSize) {
-    const batch = manifest.files.slice(index, index + batchSize);
+  const workerBatches = buildWorkerBatches(manifest.files, batchSize);
+  const usedWorkers = new Set<DevWorkerAgentId>();
+  let generatedCount = 0;
+
+  for (const workerBatch of workerBatches) {
+    const batch = workerBatch.files;
+    const workerLabel = devWorkerLabel(workerBatch.agentId);
+    usedWorkers.add(workerBatch.agentId);
+    await input.onAgentActivity?.({
+      agentId: workerBatch.agentId,
+      eventType: 'CODING',
+      task: `${workerLabel} generating ${batch.length} owned file(s)`,
+      toAgent: 'dev',
+      artifact: 'generated-files'
+    });
     await input.onProgress?.({
-      stepId: 'dev',
+      stepId: workerBatch.agentId,
       stepStatus: 'RUNNING',
       message:
         batch.length === 1
-          ? `DEV generating file ${index + 1}/${manifest.files.length}: ${batch[0].path}`
-          : `DEV generating files ${index + 1}-${index + batch.length}/${manifest.files.length}: ${batch.map((file) => file.path).join(', ')}`
+          ? `${workerLabel} generating file ${generatedCount + 1}/${manifest.files.length}: ${batch[0].path}`
+          : `${workerLabel} generating files ${generatedCount + 1}-${generatedCount + batch.length}/${manifest.files.length}: ${batch.map((file) => file.path).join(', ')}`
     });
 
     const batchFiles = await requestGeneratedFileBatch({
@@ -963,6 +1132,7 @@ export async function runDevAgent(input: {
         requirements: input.requirements,
         techSpec,
         requirementImages: input.requirementImages ?? undefined,
+        freeImageCandidates: input.freeImageCandidates ?? undefined,
         preparedTechStack: input.preparedTechStack,
         baOutput: input.baOutput,
         existingFiles: input.existingFiles,
@@ -970,6 +1140,9 @@ export async function runDevAgent(input: {
         repairScope: input.repairScope,
         projectDevSkill: input.projectDevSkill,
         enrichedSkillContext: input.enrichedSkillContext,
+        modelOverride: input.modelOverride,
+        agentModelOverrides: input.agentModelOverrides,
+        workerAgentId: workerBatch.agentId,
         onProgress: input.onProgress,
         signal: input.signal
       },
@@ -979,16 +1152,33 @@ export async function runDevAgent(input: {
 
     for (const file of batchFiles) {
       files.push(file);
+      generatedCount += 1;
       await input.onProgress?.({
-        stepId: 'dev',
+        stepId: workerBatch.agentId,
         stepStatus: 'RUNNING',
         level: 'success',
-        message: `DEV generated ${file.path}.`
+        message: `${workerLabel} generated ${file.path}.`
       });
     }
   }
 
-  await input.onProgress?.({ stepId: 'dev', stepStatus: 'PASS', level: 'success', message: 'DEV generated all planned files.' });
+  for (const workerAgentId of Array.from(usedWorkers)) {
+    await input.onProgress?.({
+      stepId: workerAgentId,
+      stepStatus: 'PASS',
+      level: 'success',
+      message: `${devWorkerLabel(workerAgentId)} completed owned file generation.`
+    });
+    await input.onAgentActivity?.({
+      agentId: workerAgentId,
+      eventType: 'WORK_COMPLETE',
+      task: `${devWorkerLabel(workerAgentId)} completed owned file generation`,
+      toAgent: 'dev',
+      artifact: 'generated-files'
+    });
+  }
+
+  await input.onProgress?.({ stepId: 'dev', stepStatus: 'PASS', level: 'success', message: 'DEV lead integrated all planned files.' });
   const outputFiles = input.repairScope ? mergeWithExistingFiles(files, input.existingFiles) : files;
   return DevOutputSchema.parse({
     architecture: manifest.architecture,

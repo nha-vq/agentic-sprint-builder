@@ -46,7 +46,11 @@ export default async function RunsPage() {
                     <p>Events: {run.events.length}</p>
                     <p>Files changed: {run.devOutput.files.length}</p>
                     <p>QA status: {run.qaStatus || 'Not recorded'}</p>
+                    <p>AI cost: {run.costSummary ? `$${run.costSummary.totalUsd.toFixed(run.costSummary.totalUsd >= 1 ? 2 : 4)}` : '$0.0000'}</p>
+                    <p>Code review fixes: {run.codeReviewFixIterations ?? 0}</p>
+                    <p>DevOps fixes: {run.deployFixIterations ?? 0}</p>
                     <p>Readiness fixes: {run.buildReadinessFixIterations ?? 0}</p>
+                    <p>Free image candidates: {run.freeImageCandidates?.length ?? 0}</p>
                     <p>Execution validation: {run.executionValidation?.status || 'Not recorded'}</p>
                     <p>
                       Runtime:{' '}
