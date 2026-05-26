@@ -20,6 +20,13 @@ type DashboardStatus = {
   company_id?: string | null;
   name?: string;
   agents: DashboardAgentView[];
+  warnings?: string[];
+  connectivity?: {
+    checked: boolean;
+    reachable: boolean;
+    status?: number;
+    error?: string;
+  };
   info?: string;
 };
 
@@ -39,6 +46,7 @@ export default function HomePage() {
   const [lastCompanyId, setLastCompanyId] = useState('');
   const [dashboardStatus, setDashboardStatus] = useState<DashboardStatus | null>(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
+  const [dashboardEventMessage, setDashboardEventMessage] = useState('');
   const [dismissedRancherToastKey, setDismissedRancherToastKey] = useState('');
 
   useEffect(() => {
@@ -177,6 +185,29 @@ export default function HomePage() {
     await runDashboardAction(() => fetch(`/api/dashboard/agents${query}`, { method: 'DELETE' }));
   }
 
+  async function testDashboardEvent() {
+    setDashboardLoading(true);
+    setDashboardEventMessage('');
+    setError('');
+    try {
+      const response = await fetch('/api/dashboard/event-test', { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Dashboard event test failed');
+
+      setDashboardStatus(data.status);
+      const event = data.event as RunResult['events'][number];
+      setDashboardEventMessage(
+        event.dashboardAccepted
+          ? `Diagnostic event accepted${event.dashboardPath ? ` via ${event.dashboardPath}` : ''}${event.dashboardStatus ? ` (${event.dashboardStatus})` : ''}.`
+          : `Diagnostic event not accepted${event.dashboardPath ? ` via ${event.dashboardPath}` : ''}${event.dashboardStatus ? ` (${event.dashboardStatus})` : ''}: ${event.dashboardError || event.dashboardResponse || 'no dashboard response'}`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setDashboardLoading(false);
+    }
+  }
+
   async function deleteCompany(companyId: string) {
     setError('');
     try {
@@ -243,6 +274,14 @@ export default function HomePage() {
               <Link href="/runs" className="rounded-2xl border border-slate-200 px-4 py-2.5 text-center font-semibold hover:bg-slate-50">
                 View Runs
               </Link>
+              <button
+                onClick={testDashboardEvent}
+                disabled={dashboardLoading || !(dashboardStatus?.company_id || lastCompanyId)}
+                className="rounded-2xl border border-slate-200 px-4 py-2.5 text-center font-semibold hover:bg-slate-50 disabled:opacity-50"
+              >
+                Test Dashboard Event
+              </button>
+              {dashboardEventMessage && <p className="text-xs text-slate-600">{dashboardEventMessage}</p>}
             </div>
           </div>
         </section>
@@ -376,6 +415,11 @@ function DashboardIdentitySummary({
         Company ID: {status?.company_id ? <span className="font-semibold text-slate-900">{status.company_id}</span> : <span className="text-slate-400">Not created</span>}
         {loading && <span className="ml-2 text-blue-600">Updating...</span>}
       </p>
+      {status?.connectivity?.checked ? (
+        <p className={`text-xs font-semibold ${status.connectivity.reachable ? 'text-emerald-700' : 'text-amber-700'}`}>
+          Dashboard API: {status.connectivity.reachable ? `reachable${status.connectivity.status ? ` (${status.connectivity.status})` : ''}` : `unreachable${status.connectivity.error ? ` - ${status.connectivity.error}` : ''}`}
+        </p>
+      ) : null}
       <div className="grid max-w-6xl grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
         {(status?.agents ?? []).map((agent) => (
           <span
@@ -409,6 +453,13 @@ function DashboardIdentitySummary({
           Agents created: {createdAgents.length}/{status?.agents.length ?? 0}
         </p>
       )}
+      {status?.warnings?.length ? (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {status.warnings.map((warning) => (
+            <p key={warning}>{warning}</p>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -737,6 +788,11 @@ function CompletionDock({ result, onOpenProgress }: { result: RunResult; onOpenP
           Open generated page
         </a>
       )}
+      {result.observationReportUrl && (
+        <a href={result.observationReportUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-blue-200 px-4 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-50">
+          Open report
+        </a>
+      )}
       <Link href={`/runs/${result.runId}`} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800">
         View Run
       </Link>
@@ -821,11 +877,24 @@ function RunResultView({ result }: { result: RunResult }) {
         <p className="mt-1 text-sm text-slate-500">QA fix iterations: {result.qaFixIterations ?? 0}</p>
         <p className="mt-1 text-sm text-slate-500">Execution validation fixes: {result.executionValidationFixIterations ?? 0}</p>
         <p className="mt-1 text-sm font-semibold text-slate-700">AI cost: {result.costSummary ? formatUsd(result.costSummary.totalUsd) : '$0.0000'}</p>
+        {result.visualComparison ? (
+          <p className="mt-1 text-sm font-semibold text-slate-700">
+            Visual comparison: {result.visualComparison.score}/100 ({result.visualComparison.status})
+          </p>
+        ) : null}
+        {result.costBudgetUsd ? (
+          <p className={`mt-1 text-sm font-semibold ${result.costBudgetExceeded ? 'text-amber-700' : 'text-slate-500'}`}>
+            Cost budget: {formatUsd(result.costBudgetUsd)}{result.costBudgetExceeded ? ' reached' : ''}
+          </p>
+        ) : null}
         <p className="mt-1 text-sm text-slate-500">Free image candidates: {result.freeImageCandidates?.length ?? 0}</p>
+        <p className="mt-1 text-sm text-slate-500">Prepared media assets: {result.preparedMediaAssets?.length ?? 0}</p>
+        <p className="mt-1 text-sm text-slate-500">TA DEV context: {result.projectDevContextPath || result.projectDevSkillPath || 'Not recorded'}</p>
         <p className="mt-1 text-sm text-slate-500">Artifacts: {result.outputDir}</p>
         <p className="mt-1 text-sm text-slate-500">Generated code: {result.codeOutputDir}</p>
         <ExecutionValidationStatus result={result} />
         <RuntimeStatus result={result} />
+        <DashboardEventSummary result={result} />
         <div className="mt-4 flex flex-wrap gap-3">
           {getGeneratedFrontendUrl(result) && (
             <a href={getGeneratedFrontendUrl(result)} target="_blank" rel="noreferrer" className="inline-flex rounded-2xl bg-blue-600 px-5 py-3 font-semibold text-white hover:bg-blue-700">
@@ -835,27 +904,63 @@ function RunResultView({ result }: { result: RunResult }) {
           <Link href={`/runs/${result.runId}`} className="inline-flex rounded-2xl bg-slate-900 px-5 py-3 font-semibold text-white hover:bg-slate-800">
             Open run output
           </Link>
+          {result.observationReportUrl && (
+            <a href={result.observationReportUrl} target="_blank" rel="noreferrer" className="inline-flex rounded-2xl border border-blue-200 px-5 py-3 font-semibold text-blue-700 hover:bg-blue-50">
+              Open observation report
+            </a>
+          )}
         </div>
         <div className="mt-4 grid gap-3 md:grid-cols-3">
           {result.events.map((event, index) => (
             <div key={`${event.timestamp}-${index}`} className="rounded-2xl border border-slate-200 p-4">
               <p className="text-sm font-bold uppercase text-blue-600">{event.agentId} · {event.eventType}</p>
               <p className="mt-2 text-sm text-slate-700">{event.task}</p>
-              <p className="mt-2 text-xs text-slate-400">Dashboard: {event.dashboardAccepted ? 'accepted' : 'local only'}</p>
+              <p className="mt-2 text-xs text-slate-400">
+                Dashboard: {event.dashboardAccepted ? 'accepted' : event.dashboardError ? 'rejected' : 'local only'}
+                {event.dashboardStatus ? ` (${event.dashboardStatus})` : ''}
+              </p>
+              {event.dashboardError ? <p className="mt-1 break-words text-xs text-red-500">{event.dashboardError}</p> : null}
             </div>
           ))}
         </div>
       </div>
 
       <Artifact title="BA Artifacts" content={result.baOutput} />
+      {result.uxContract ? <Artifact title="UX Contract" content={JSON.stringify(result.uxContract, null, 2)} /> : null}
       {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
       {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
+      {result.costControlNotes?.length ? <Artifact title="Cost Controls" content={result.costControlNotes.map((note) => `- ${note}`).join('\n')} /> : null}
+      {result.visualComparison ? <Artifact title="Visual Comparison" content={formatVisualComparison(result.visualComparison)} /> : null}
       <Artifact title="Architecture" content={result.devOutput.architecture} />
       <Artifact title="Generated Files" content={result.devOutput.files.map((file) => `### ${file.path}\n\n\`\`\`\n${file.content}\n\`\`\``).join('\n\n')} />
       <Artifact title="Setup Instructions" content={result.devOutput.setupInstructions} />
       {result.freeImageCandidates?.length ? <Artifact title="Free Image Candidates" content={formatFreeImageCandidates(result.freeImageCandidates)} /> : null}
+      {result.preparedMediaAssets?.length ? <Artifact title="Prepared Media Assets" content={formatPreparedMediaAssets(result.preparedMediaAssets)} /> : null}
       <Artifact title="QA Report" content={result.qaOutput} />
     </section>
+  );
+}
+
+function DashboardEventSummary({ result }: { result: RunResult }) {
+  if (!result.events.length) return null;
+  const accepted = result.events.filter((event) => event.dashboardAccepted).length;
+  const rejected = result.events.filter((event) => !event.dashboardAccepted && event.dashboardError).length;
+  const localOnly = result.events.length - accepted - rejected;
+  const firstRejected = result.events.find((event) => !event.dashboardAccepted && event.dashboardError);
+
+  return (
+    <div className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${rejected ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>
+      <p className="font-semibold">
+        Dashboard events: {accepted} accepted, {rejected} rejected, {localOnly} local only
+      </p>
+      {firstRejected ? (
+        <p className="mt-1 break-words text-xs">
+          First rejection: {firstRejected.agentId}/{firstRejected.eventType}
+          {firstRejected.dashboardPath ? ` via ${firstRejected.dashboardPath}` : ''}
+          {firstRejected.dashboardStatus ? ` (${firstRejected.dashboardStatus})` : ''}: {firstRejected.dashboardError}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -868,6 +973,24 @@ function formatFreeImageCandidates(candidates: NonNullable<RunResult['freeImageC
 - Image URL: ${candidate.imageUrl}
 - Source page: ${candidate.pageUrl}
 - License: ${candidate.license}${candidate.licenseUrl ? `\n- License URL: ${candidate.licenseUrl}` : ''}
+`
+    )
+    .join('\n');
+}
+
+function formatPreparedMediaAssets(assets: NonNullable<RunResult['preparedMediaAssets']>) {
+  return assets
+    .map(
+      (asset, index) => `### ${index + 1}. ${asset.title}
+
+- Public URL: ${asset.publicUrl}
+- Generated path: ${asset.path}
+- Source image: ${asset.sourceImageUrl}
+- Source page: ${asset.sourcePageUrl}
+- Download URL: ${asset.downloadUrl}
+- License: ${asset.license}${asset.licenseUrl ? `\n- License URL: ${asset.licenseUrl}` : ''}
+- Query: ${asset.query}
+- Type/size: ${asset.mimeType}, ${Math.round(asset.sizeBytes / 1024)} KB
 `
     )
     .join('\n');
@@ -890,6 +1013,25 @@ function formatCostSummary(summary: NonNullable<RunResult['costSummary']>) {
     '',
     '## By Model',
     ...summary.byModel.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`)
+  ].join('\n');
+}
+
+function formatVisualComparison(comparison: NonNullable<RunResult['visualComparison']>) {
+  return [
+    `Status: ${comparison.status}`,
+    `Score: ${comparison.score}/100`,
+    `Report: ${comparison.reportPath}`,
+    `URL: ${comparison.reportUrl}`,
+    '',
+    '## Findings',
+    ...(comparison.findings.length ? comparison.findings.map((finding) => `- ${finding}`) : ['- none']),
+    '',
+    '## Recommendations',
+    ...(comparison.recommendations.length ? comparison.recommendations.map((item) => `- ${item}`) : ['- none']),
+    '',
+    '## Evidence',
+    `- Mockups: ${comparison.mockups.length}`,
+    `- Screenshots: ${comparison.screenshots.length}`
   ].join('\n');
 }
 

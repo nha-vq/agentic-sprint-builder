@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import { runMarkdownSkillAgent } from './base-agent';
+import { formatUXContractForPrompt } from './ux-agent';
 import { formatGeneratedCodeContext, formatGeneratedProjectOverview, formatRunHistoryContext } from '@/lib/context/agent-context';
 import { RUN_LIMITS } from '@/lib/config/limits';
 import { extractJsonObject } from '@/lib/utils/json';
 import { formatRepairScope } from '@/lib/validation/repair-scope';
 import type { ProjectDevSkill } from '@/lib/skills/project-dev-skill';
-import type { AgentId, DashboardEventType, DevOutput, FreeImageCandidate, GeneratedFile, PreparedTechStackOutput, RepairScope, RequirementImage, RunProgressReporter, RunResult } from '@/lib/types';
+import { formatPreparedMediaAssetsForPrompt } from '@/lib/media/prepared-assets';
+import type { AgentId, DashboardEventType, DevOutput, FreeImageCandidate, GeneratedFile, PreparedMediaAsset, PreparedTechStackOutput, RepairScope, RequirementImage, RunProgressReporter, RunResult, UXContractOutput } from '@/lib/types';
 
 type DevWorkerAgentId = Extract<AgentId, 'dev' | 'frontend-dev' | 'backend-dev' | 'integration-dev'>;
 
@@ -456,6 +458,8 @@ function buildDevContext(input: {
   techSpec: string;
   requirementImages?: RequirementImage[] | null;
   freeImageCandidates?: FreeImageCandidate[] | null;
+  preparedMediaAssets?: PreparedMediaAsset[] | null;
+  uxContract?: UXContractOutput | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingCode: string;
@@ -478,7 +482,7 @@ QA or build feedback is present. Follow the repair rules in the loaded DEV skill
   return `
 Use the loaded DEV skill as the source of generation behavior, architecture rules, technology defaults, validation expectations, and repair rules.
 Application source only provides context and output-format constraints.
-If no project-specific skill is loaded, use the overall DEV skill for first generation.
+If no TA DEV context is loaded, use the static DEV skill for first generation.
 If existing generated code is provided, update that project according to the loaded skill and current request.
 
 REQUIREMENTS:
@@ -492,6 +496,12 @@ ${formatRequirementImageContext(input.requirementImages)}
 
 FREE/SAFE IMAGE CANDIDATES:
 ${formatFreeImageCandidateContext(input.freeImageCandidates)}
+
+PREPARED LOCAL MEDIA ASSETS:
+${formatPreparedMediaAssetsForPrompt(input.preparedMediaAssets)}
+
+STABLE UX/UI CONTRACT:
+${formatUXContractForPrompt(input.uxContract)}
 
 PREPARED TECH STACK (SOURCE OF TRUTH WHEN PRESENT):
 ${input.preparedTechStack ? JSON.stringify(input.preparedTechStack, null, 2) : 'Not prepared. If this is first generation, report this as a workflow issue and use safe skill defaults only when instructed by the orchestrator.'}
@@ -565,7 +575,7 @@ Return a compact manifest only: architecture, setupInstructions, and files with 
 Do not include file content in this response.
 Keep setupInstructions concise. Avoid markdown lists inside JSON strings.
 Do not plan package lockfiles, vendored dependencies, build outputs, binary/base64 assets, screenshots, huge fixtures, or massive seed datasets unless explicitly required.
-Plan all files required by the loaded DEV skill, BA output, requirements, tech spec, and any repair scope.
+Plan all files required by the loaded DEV skill, TA DEV context, BA output, requirements, tech spec, and any repair scope.
 The file list must be complete enough for the generated project to satisfy the loaded skill and local validation.
 If requirement images are attached, include the frontend page, component, style/theme, layout, and seed-media files needed to implement the BA Frontend Visual Design Contract rather than a generic scaffold.
 ${attempt > 1 ? 'Previous manifest response failed or was truncated. Return shorter valid JSON only.' : ''}
@@ -595,6 +605,8 @@ function buildBatchFileContext(input: {
   techSpec: string;
   requirementImages?: RequirementImage[] | null;
   freeImageCandidates?: FreeImageCandidate[] | null;
+  preparedMediaAssets?: PreparedMediaAsset[] | null;
+  uxContract?: UXContractOutput | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   qaFeedback: string;
@@ -646,6 +658,12 @@ ${formatRequirementImageContext(input.requirementImages)}
 
 FREE/SAFE IMAGE CANDIDATES:
 ${formatFreeImageCandidateContext(input.freeImageCandidates)}
+
+PREPARED LOCAL MEDIA ASSETS:
+${formatPreparedMediaAssetsForPrompt(input.preparedMediaAssets)}
+
+STABLE UX/UI CONTRACT:
+${formatUXContractForPrompt(input.uxContract)}
 
 PREPARED TECH STACK EXCERPT:
 ${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), 6_000) : 'Not prepared.'}
@@ -702,6 +720,8 @@ async function requestGeneratedFile(params: {
     techSpec: string;
     requirementImages?: RequirementImage[];
     freeImageCandidates?: FreeImageCandidate[];
+    preparedMediaAssets?: PreparedMediaAsset[];
+    uxContract?: UXContractOutput | null;
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -724,6 +744,8 @@ async function requestGeneratedFile(params: {
     techSpec: params.input.techSpec,
     requirementImages: attachedImages,
     freeImageCandidates: params.input.freeImageCandidates,
+    preparedMediaAssets: params.input.preparedMediaAssets,
+    uxContract: params.input.uxContract,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -853,6 +875,8 @@ async function requestGeneratedFileBatch(params: {
     techSpec: string;
     requirementImages?: RequirementImage[];
     freeImageCandidates?: FreeImageCandidate[];
+    preparedMediaAssets?: PreparedMediaAsset[];
+    uxContract?: UXContractOutput | null;
     preparedTechStack?: PreparedTechStackOutput;
     baOutput: string;
     existingFiles?: GeneratedFile[];
@@ -887,6 +911,8 @@ async function requestGeneratedFileBatch(params: {
     techSpec: params.input.techSpec,
     requirementImages: attachedImages,
     freeImageCandidates: params.input.freeImageCandidates,
+    preparedMediaAssets: params.input.preparedMediaAssets,
+    uxContract: params.input.uxContract,
     preparedTechStack: params.input.preparedTechStack,
     baOutput: params.input.baOutput,
     qaFeedback: params.input.qaFeedback,
@@ -983,6 +1009,8 @@ export async function runDevAgent(input: {
   techSpec?: string | null;
   requirementImages?: RequirementImage[] | null;
   freeImageCandidates?: FreeImageCandidate[] | null;
+  preparedMediaAssets?: PreparedMediaAsset[] | null;
+  uxContract?: UXContractOutput | null;
   preparedTechStack?: PreparedTechStackOutput;
   baOutput: string;
   existingFiles?: GeneratedFile[];
@@ -1006,14 +1034,14 @@ export async function runDevAgent(input: {
   const previousDevOutput = formatPreviousDevOutput(input.previousDevOutput);
   const qaFeedback = input.qaFeedback?.trim() || 'No QA feedback yet.';
   const projectDevSkillStatus = input.projectDevSkill
-    ? `Loaded project-specific dev skill for ${input.projectDevSkill.projectId} from ${input.projectDevSkill.path}. Use it to preserve stack, structure, commands, routes, env vars, and implemented features.`
-    : 'No project-specific dev skill is loaded. Use the overall DEV skill for first scaffold generation.';
+    ? `Loaded TA DEV context for ${input.projectDevSkill.projectId} from ${input.projectDevSkill.path}. Use it to preserve stack, structure, commands, routes, env vars, implemented features, and accumulated failure lessons.`
+    : 'No TA DEV context is loaded. Use the static DEV skill for first scaffold generation.';
 
   await input.onProgress?.({
     stepId: 'dev',
     stepStatus: 'RUNNING',
     level: 'info',
-    message: input.projectDevSkill ? `DEV using project-specific skill: ${input.projectDevSkill.path}` : 'DEV using overall dev skill; no project-specific skill exists yet.'
+    message: input.projectDevSkill ? `DEV using static skill plus TA context: ${input.projectDevSkill.path}` : 'DEV using static skill; no TA context exists yet.'
   });
 
   if (input.requirementImages?.length) {
@@ -1034,6 +1062,15 @@ export async function runDevAgent(input: {
     });
   }
 
+  if (input.preparedMediaAssets?.length) {
+    await input.onProgress?.({
+      stepId: 'dev',
+      stepStatus: 'RUNNING',
+      level: 'success',
+      message: `DEV received ${input.preparedMediaAssets.length} prepared local media asset(s); frontend should use /assets/generated-media paths.`
+    });
+  }
+
   if (input.repairScope && (input.existingFiles?.length ?? 0) > 0) {
     await input.onProgress?.({
       stepId: 'dev',
@@ -1047,6 +1084,8 @@ export async function runDevAgent(input: {
     techSpec,
     requirementImages: input.requirementImages,
     freeImageCandidates: input.freeImageCandidates,
+    preparedMediaAssets: input.preparedMediaAssets,
+    uxContract: input.uxContract,
     preparedTechStack: input.preparedTechStack,
     baOutput: input.baOutput,
     existingCode,
@@ -1133,6 +1172,8 @@ export async function runDevAgent(input: {
         techSpec,
         requirementImages: input.requirementImages ?? undefined,
         freeImageCandidates: input.freeImageCandidates ?? undefined,
+        preparedMediaAssets: input.preparedMediaAssets ?? undefined,
+        uxContract: input.uxContract,
         preparedTechStack: input.preparedTechStack,
         baOutput: input.baOutput,
         existingFiles: input.existingFiles,

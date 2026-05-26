@@ -20,6 +20,7 @@ const STOP_WORDS = new Set([
   'artifact',
   'based',
   'build',
+  'cart',
   'can',
   'create',
   'dashboard',
@@ -40,8 +41,10 @@ const STOP_WORDS = new Set([
   'image',
   'images',
   'implementation',
+  'implementing',
   'input',
   'into',
+  'layout',
   'need',
   'needs',
   'only',
@@ -55,6 +58,8 @@ const STOP_WORDS = new Set([
   'search',
   'should',
   'show',
+  'shopping',
+  'simple',
   'stack',
   'story',
   'tech',
@@ -185,14 +190,53 @@ function extractTitleQuery(text: string) {
   return words?.join(' ') || '';
 }
 
+function cleanSubjectPhrase(value: string) {
+  const words =
+    value
+      .match(/[A-Za-z][A-Za-z0-9-]{1,}/g)
+      ?.map(normalizeKeyword)
+      .filter((word) => word && !STOP_WORDS.has(word) && !/^(full|stack|frontend|backend|ui|ux|nfrs?|mockups?|screenshots?)$/.test(word))
+      .slice(0, 4) ?? [];
+
+  return words.join(' ');
+}
+
+function extractDomainQueries(text: string) {
+  const normalized = text.toLowerCase();
+
+  if (/\b(?:watch|watches|wristwatch|wristwatches|timepiece|timepieces)\b/i.test(text)) {
+    return ['luxury wristwatch product photo', 'mechanical watch product photo', 'luxury watch collection'];
+  }
+
+  const subjectPatterns = [
+    /\bbuild\s+(?:a|an|the)?\s*(?:full-stack\s+)?(.{3,80}?)(?:\s+(?:shopping cart|e-?commerce|store|shop|catalog|product|app|application)\b)/i,
+    /\b(?:store|shop|catalog|marketplace)\s+(?:for|of)\s+(.{3,80}?)(?:[.\n]|$)/i,
+    /\b(?:products?|items?)\s+(?:for|of)\s+(.{3,80}?)(?:[.\n]|$)/i
+  ];
+
+  for (const pattern of subjectPatterns) {
+    const subject = cleanSubjectPhrase(pattern.exec(text)?.[1] || '');
+    if (subject) {
+      return [`${subject} product photo`, `${subject} product collection`, `${subject} ecommerce product`];
+    }
+  }
+
+  const domainKeywords = extractKeywords(normalized).filter(
+    (word) => !/^(home|detail|header|footer|navigation|navbar|menu|mockup|wireframe|screen|screens|pages?)$/.test(word)
+  );
+  const subject = domainKeywords.slice(0, 2).join(' ');
+  return subject ? [`${subject} product photo`, `${subject} product collection`] : [];
+}
+
 function buildQueries(params: { requirements: string; techSpec?: string | null; topic?: string }) {
   const text = `${params.topic || ''}\n${params.requirements}\n${params.techSpec || ''}`;
+  const domainQueries = extractDomainQueries(text);
   const keywords = extractKeywords(text);
   const titleQuery = extractTitleQuery(params.requirements);
   const baseQuery = titleQuery || keywords.slice(0, 4).join(' ') || params.topic || 'modern application';
   const secondaryQuery = keywords.slice(0, 5).join(' ');
 
-  return [baseQuery, secondaryQuery, `${baseQuery} mockup interface`]
+  return [...domainQueries, baseQuery, secondaryQuery, `${baseQuery} product interface`]
     .map((query) => query.trim().replace(/\s+/g, ' '))
     .filter((query, index, queries) => query.length > 0 && queries.indexOf(query) === index)
     .slice(0, MAX_QUERIES);

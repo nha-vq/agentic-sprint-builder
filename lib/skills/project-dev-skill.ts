@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { parseSkillMarkdown, type LoadedSkill } from '@/lib/skills/loadSkill';
-import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput } from '@/lib/types';
+import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, UXContractOutput } from '@/lib/types';
 
 export const DEFAULT_PROJECT_ID = 'generated-code';
 
@@ -10,6 +10,9 @@ const MAX_SKILL_SECTION_CHARS = 6_000;
 const MAX_BA_EXCERPT_CHARS = 4_000;
 const MAX_REQUIREMENTS_EXCERPT_CHARS = 4_000;
 const MAX_VISUAL_CONTRACT_CHARS = 8_000;
+const MAX_LEARNING_MEMORY_CHARS = 8_000;
+const PROJECT_DEV_CONTEXT_FILENAME = 'ta-dev-context.md';
+const LEGACY_PROJECT_DEV_SKILL_FILENAME = 'dev.md';
 
 export interface ProjectDevSkill extends LoadedSkill {
   projectId: string;
@@ -21,10 +24,12 @@ export interface ProjectDevSkillWriteInput {
   requirements: string;
   techSpec?: string | null;
   preparedTechStack?: PreparedTechStackOutput;
+  uxContract?: UXContractOutput;
   baOutput: string;
   devOutput: DevOutput;
   executionValidation?: GeneratedExecutionValidationResult;
   qaReview?: QAReviewOutput;
+  learningNotes?: string[];
   reason: string;
 }
 
@@ -60,6 +65,12 @@ function extractMarkdownSection(markdown: string, heading: string) {
   return lines.slice(start, end).join('\n').trim();
 }
 
+function extractMarkdownSectionBody(markdown: string, heading: string) {
+  const section = extractMarkdownSection(markdown, heading);
+  if (!section) return '';
+  return section.split(/\r?\n/).slice(1).join('\n').trim();
+}
+
 function visualContractExcerpt(baOutput: string) {
   const section = extractMarkdownSection(baOutput, 'Frontend Visual Design Contract');
   if (!section) {
@@ -67,6 +78,34 @@ function visualContractExcerpt(baOutput: string) {
   }
 
   return truncate(section, MAX_VISUAL_CONTRACT_CHARS);
+}
+
+function uxContractExcerpt(contract?: UXContractOutput | null) {
+  if (!contract) return 'No UX contract was generated yet. Future runs should create one before DEV implementation.';
+  return truncate(
+    [
+      `Summary: ${contract.summary}`,
+      '',
+      `Information Architecture:\n${contract.informationArchitecture}`,
+      '',
+      `Layout Contract:\n${contract.layoutContract}`,
+      '',
+      `Component Inventory:\n${contract.componentInventory.map((item) => `- ${item}`).join('\n')}`,
+      '',
+      `Visual Design Tokens:\n${contract.visualDesignTokens}`,
+      '',
+      `Image Treatment:\n${contract.imageTreatment}`,
+      '',
+      `Responsive Rules:\n${contract.responsiveRules}`,
+      '',
+      `Interaction Rules:\n${contract.interactionRules}`,
+      '',
+      `Consistency Rules:\n${contract.consistencyRules.map((item) => `- ${item}`).join('\n')}`,
+      '',
+      `DEV Handoff Checklist:\n${contract.devHandoffChecklist.map((item) => `- ${item}`).join('\n')}`
+    ].join('\n'),
+    MAX_VISUAL_CONTRACT_CHARS
+  );
 }
 
 function normalizePath(filePath: string) {
@@ -116,8 +155,16 @@ export function getProjectSkillDir(projectId = DEFAULT_PROJECT_ID) {
   return path.join(process.cwd(), 'project-skills', normalizeProjectId(projectId));
 }
 
+export function getProjectDevContextPath(projectId = DEFAULT_PROJECT_ID) {
+  return path.join(getProjectSkillDir(projectId), PROJECT_DEV_CONTEXT_FILENAME);
+}
+
+export function getLegacyProjectDevSkillPath(projectId = DEFAULT_PROJECT_ID) {
+  return path.join(getProjectSkillDir(projectId), LEGACY_PROJECT_DEV_SKILL_FILENAME);
+}
+
 export function getProjectDevSkillPath(projectId = DEFAULT_PROJECT_ID) {
-  return path.join(getProjectSkillDir(projectId), 'dev.md');
+  return getProjectDevContextPath(projectId);
 }
 
 export function getProjectSkillMetadataPath(projectId = DEFAULT_PROJECT_ID) {
@@ -253,6 +300,80 @@ function migrationSummaries(files: GeneratedFile[]) {
   return unique([...migrationFiles.map((filePath) => `Schema/migration file: ${filePath}`), ...seedFiles.map((filePath) => `Seed/sample data file: ${filePath}`)]);
 }
 
+async function readExistingProjectContextMarkdown(projectId: string) {
+  for (const candidate of [getProjectDevContextPath(projectId), getLegacyProjectDevSkillPath(projectId)]) {
+    if (await pathExists(candidate)) {
+      return fs.readFile(candidate, 'utf-8');
+    }
+  }
+
+  return '';
+}
+
+function previousLearningLessons(previousMarkdown: string) {
+  const body = extractMarkdownSectionBody(previousMarkdown, 'TA Learning Memory');
+  if (!body) return [];
+
+  return body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('- '))
+    .filter((line) => !/No accumulated failure lessons yet/i.test(line));
+}
+
+function compactLearningNote(note: string) {
+  const normalized = note.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  const compacted = normalized.length <= 700 ? normalized : `${normalized.slice(0, 700)} ...[truncated ${normalized.length - 700} chars]`;
+  return `- ${compacted}`;
+}
+
+function learningNotesFromSignals(input: {
+  reason: string;
+  executionValidation?: GeneratedExecutionValidationResult;
+  qaReview?: QAReviewOutput;
+  learningNotes?: string[];
+}) {
+  const notes: string[] = [];
+
+  if (/feedback|repair|fix|validation|qa|deploy|review|readiness/i.test(input.reason)) {
+    notes.push(`Trigger: ${input.reason}`);
+  }
+
+  for (const note of input.learningNotes ?? []) {
+    notes.push(note);
+  }
+
+  if (input.executionValidation?.status === 'NEEDS_FIX') {
+    notes.push(`Execution validation failed. Findings: ${(input.executionValidation.findings ?? []).join('; ') || 'No explicit findings.'}`);
+    if (input.executionValidation.fixInstructions?.trim()) {
+      notes.push(`Execution repair guidance: ${input.executionValidation.fixInstructions}`);
+    }
+  }
+
+  if (input.qaReview?.status === 'NEEDS_FIX') {
+    notes.push(`QA failed. Findings: ${(input.qaReview.findings ?? []).join('; ') || 'No explicit findings.'}`);
+    if (input.qaReview.fixInstructions?.trim()) {
+      notes.push(`QA repair guidance: ${input.qaReview.fixInstructions}`);
+    }
+  }
+
+  return notes.map(compactLearningNote).filter(Boolean);
+}
+
+function taLearningMemory(previousMarkdown: string, input: {
+  reason: string;
+  executionValidation?: GeneratedExecutionValidationResult;
+  qaReview?: QAReviewOutput;
+  learningNotes?: string[];
+}) {
+  const existing = previousLearningLessons(previousMarkdown);
+  const next = learningNotesFromSignals(input);
+  const combined = unique([...existing, ...next]).slice(-60);
+  const markdown = combined.length ? combined.join('\n') : '- No accumulated failure lessons yet.';
+  return truncate(markdown, MAX_LEARNING_MEMORY_CHARS);
+}
+
 function finalStatus(input: ProjectDevSkillWriteInput) {
   const statusLines = [
     `Last update reason: ${input.reason}`,
@@ -279,7 +400,7 @@ async function readProjectDevSkillTemplate() {
   try {
     return await fs.readFile(templatePath, 'utf-8');
   } catch (error) {
-    throw new Error(`Project DEV skill template is missing or unreadable at ${templatePath}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`TA DEV context template is missing or unreadable at ${templatePath}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -289,6 +410,7 @@ function renderTemplate(template: string, values: Record<string, string>) {
 
 async function buildProjectDevSkillMarkdown(input: ProjectDevSkillWriteInput) {
   const projectId = normalizeProjectId(input.projectId);
+  const previousMarkdown = await readExistingProjectContextMarkdown(projectId);
   const files = input.devOutput.files;
   const stack = inferStack(files);
   const overview = formatGeneratedProjectOverview(files);
@@ -303,6 +425,7 @@ async function buildProjectDevSkillMarkdown(input: ProjectDevSkillWriteInput) {
     REQUIREMENTS_EXCERPT: truncate(input.requirements || 'Not provided.', MAX_REQUIREMENTS_EXCERPT_CHARS),
     BA_OUTPUT_EXCERPT: truncate(input.baOutput || 'Not provided.', MAX_BA_EXCERPT_CHARS),
     VISUAL_CONTRACT_EXCERPT: visualContractExcerpt(input.baOutput || ''),
+    UX_CONTRACT: uxContractExcerpt(input.uxContract),
     PREPARED_TECH_STACK: JSON.stringify(input.preparedTechStack ?? null, null, 2),
     FRONTEND_STACK: stack.frontend,
     BACKEND_STACK: stack.backend,
@@ -316,6 +439,7 @@ async function buildProjectDevSkillMarkdown(input: ProjectDevSkillWriteInput) {
     ROUTES: bulletList(routes, 'No route conventions detected yet. Follow the existing framework layout when adding routes.'),
     CONVENTIONS: bulletList(conventions, 'Follow the existing directory structure and import style visible in generated-code.'),
     MIGRATIONS: bulletList(migrations, 'No explicit migration/seed files detected. If the app owns a database, add schema/init safely and preserve existing data behavior.'),
+    TA_LEARNING_MEMORY: taLearningMemory(previousMarkdown, input),
     FINAL_STATUS: finalStatus(input)
   });
 }
@@ -338,7 +462,9 @@ export function validateProjectDevSkillMarkdown(markdown: string, files: Generat
 
 export async function loadProjectDevSkill(projectId = DEFAULT_PROJECT_ID): Promise<ProjectDevSkill | null> {
   const normalizedProjectId = normalizeProjectId(projectId);
-  const skillPath = getProjectDevSkillPath(normalizedProjectId);
+  const skillPath = (await pathExists(getProjectDevContextPath(normalizedProjectId)))
+    ? getProjectDevContextPath(normalizedProjectId)
+    : getLegacyProjectDevSkillPath(normalizedProjectId);
   if (!(await pathExists(skillPath))) return null;
 
   const markdown = await fs.readFile(skillPath, 'utf-8');
@@ -356,20 +482,22 @@ export interface PreDevProjectSkillInput {
   techSpec?: string | null;
   baOutput: string;
   preparedTechStack: PreparedTechStackOutput;
+  uxContract?: UXContractOutput;
   existingFiles?: GeneratedFile[];
 }
 
 /**
- * Write a project-specific dev skill BEFORE DEV agent runs.
- * This version uses tech stack decisions + requirements + BA output
- * so that DEV can load and use the project skill from the start.
- * After DEV generates code, call writeProjectDevSkill to update with file analysis.
+ * Write TA's project-specific DEV context BEFORE DEV agent runs.
+ * Static DEV behavior stays in .github/skills/dev/SKILL.md; this file stores
+ * project memory, stack decisions, UX contract, and accumulated lessons.
+ * After DEV generates code, call writeProjectDevSkill to update file analysis.
  */
 export async function writePreDevProjectSkill(input: PreDevProjectSkillInput): Promise<ProjectDevSkill> {
   const projectId = normalizeProjectId(input.projectId);
   const skillDir = getProjectSkillDir(projectId);
   const skillPath = getProjectDevSkillPath(projectId);
   const metadataPath = getProjectSkillMetadataPath(projectId);
+  const previousMarkdown = await readExistingProjectContextMarkdown(projectId);
 
   const files = input.existingFiles ?? [];
   const stack = files.length > 0 ? inferStack(files) : {
@@ -392,6 +520,7 @@ export async function writePreDevProjectSkill(input: PreDevProjectSkillInput): P
     REQUIREMENTS_EXCERPT: truncate(input.requirements || 'Not provided.', MAX_REQUIREMENTS_EXCERPT_CHARS),
     BA_OUTPUT_EXCERPT: truncate(input.baOutput || 'Not provided.', MAX_BA_EXCERPT_CHARS),
     VISUAL_CONTRACT_EXCERPT: visualContractExcerpt(input.baOutput || ''),
+    UX_CONTRACT: uxContractExcerpt(input.uxContract),
     PREPARED_TECH_STACK: JSON.stringify(input.preparedTechStack, null, 2),
     FRONTEND_STACK: stack.frontend,
     BACKEND_STACK: stack.backend,
@@ -408,7 +537,10 @@ export async function writePreDevProjectSkill(input: PreDevProjectSkillInput): P
     ROUTES: files.length > 0 ? bulletList(routeSummaries(files)) : '- Will be determined after initial code generation.',
     CONVENTIONS: files.length > 0 ? bulletList(conventionSummaries(files)) : '- Follow the prepared tech stack architecture decisions above.',
     MIGRATIONS: files.length > 0 ? bulletList(migrationSummaries(files)) : '- Will be determined after initial code generation.',
-    FINAL_STATUS: `- Last update reason: Pre-DEV skill preparation from tech stack analysis.\n- Latest deploy smoke validation: not yet run\n- Latest QA status: not yet run`
+    TA_LEARNING_MEMORY: taLearningMemory(previousMarkdown, {
+      reason: 'Pre-DEV context preparation from tech stack analysis.'
+    }),
+    FINAL_STATUS: `- Last update reason: Pre-DEV context preparation from tech stack analysis.\n- Latest deploy smoke validation: not yet run\n- Latest QA status: not yet run`
   });
 
   await fs.mkdir(skillDir, { recursive: true });
@@ -419,9 +551,12 @@ export async function writePreDevProjectSkill(input: PreDevProjectSkillInput): P
       {
         projectId,
         skillPath,
+        contextPath: skillPath,
+        staticDevSkillPath: path.join(process.cwd(), '.github', 'skills', 'dev', 'SKILL.md'),
+        legacySkillPath: getLegacyProjectDevSkillPath(projectId),
         generatedCodePath: path.join(process.cwd(), 'generated-code'),
         updatedAt: new Date().toISOString(),
-        reason: 'Pre-DEV skill preparation from tech stack analysis.',
+        reason: 'Pre-DEV context preparation from tech stack analysis.',
         fileCount: files.length,
         phase: 'pre-dev'
       },
@@ -444,7 +579,7 @@ export async function writeProjectDevSkill(input: ProjectDevSkillWriteInput): Pr
   const validation = validateProjectDevSkillMarkdown(markdown, input.devOutput.files);
 
   if (validation.status !== 'PASS') {
-    throw new Error(`Generated project dev skill is invalid: ${validation.findings.join('; ')}`);
+    throw new Error(`Generated TA DEV context is invalid: ${validation.findings.join('; ')}`);
   }
 
   await fs.mkdir(skillDir, { recursive: true });
@@ -455,6 +590,9 @@ export async function writeProjectDevSkill(input: ProjectDevSkillWriteInput): Pr
       {
         projectId,
         skillPath,
+        contextPath: skillPath,
+        staticDevSkillPath: path.join(process.cwd(), '.github', 'skills', 'dev', 'SKILL.md'),
+        legacySkillPath: getLegacyProjectDevSkillPath(projectId),
         generatedCodePath: path.join(process.cwd(), 'generated-code'),
         updatedAt: new Date().toISOString(),
         reason: input.reason,

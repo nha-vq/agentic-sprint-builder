@@ -1,9 +1,11 @@
 import { spawn } from 'child_process';
 import fs from 'fs/promises';
+import net from 'net';
+import os from 'os';
 import path from 'path';
 import { readGeneratedCodeSnapshot } from '@/lib/storage/file-writer';
 import { inferExecutionRepairScope } from './repair-scope';
-import type { GeneratedExecutionValidationResult, GeneratedValidationStep, RunProgressReporter } from '@/lib/types';
+import type { GeneratedExecutionValidationResult, GeneratedValidationStep, PreparedMediaAsset, RunProgressReporter } from '@/lib/types';
 
 const COMMAND_TIMEOUT_MS = 180_000;
 const HEALTH_TIMEOUT_MS = 45_000;
@@ -73,8 +75,21 @@ function shouldRemoveGeneratedComposeImages() {
   return process.env.REMOVE_GENERATED_COMPOSE_IMAGES === 'true';
 }
 
+function shouldRemoveGeneratedComposeVolumes() {
+  return process.env.REMOVE_GENERATED_COMPOSE_VOLUMES !== 'false';
+}
+
 function shouldRunGeneratedTests() {
   return process.env.RUN_GENERATED_TESTS === 'true';
+}
+
+function shouldRunBrowserValidation() {
+  return process.env.VALIDATE_GENERATED_BROWSER !== 'false';
+}
+
+function getBrowserValidationVirtualTimeBudgetMs() {
+  const parsed = Number.parseInt(process.env.GENERATED_BROWSER_VIRTUAL_TIME_BUDGET_MS || '8000', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8_000;
 }
 
 function shouldAutoStartRancherDesktop() {
@@ -130,7 +145,15 @@ function truncate(value: string, maxChars = LOG_TAIL_CHARS) {
 }
 
 function isHostComposeInfrastructureFailure(message: string) {
+  if (isGeneratedCodeFailureSignal(message)) return false;
+
   return /failed to connect to the backend|timed out dialing hyper-v socket|cannot connect to the docker daemon|docker daemon is not running|error during connect|open \/\/\.\/pipe\/docker_engine|containerd socket|rancher desktop.*(?:not ready|unavailable)|docker compose engine is unavailable|local compose engine is unavailable|must be run with elevated privileges|wsl.*docker/i.test(
+    message
+  );
+}
+
+function isGeneratedCodeFailureSignal(message: string) {
+  return /failed to compile|type error|typescript|tsc|next build|npm run build|module not found|can't resolve|copy failed|failed to calculate checksum|dockerfile|process .* did not complete successfully|frontend\/|backend\/|app\/|components\/|\.tsx?\b|\.jsx?\b|\.py\b|_next\/image|url parameter is not allowed/i.test(
     message
   );
 }
@@ -360,7 +383,8 @@ function runCommand(
   cwd: string,
   timeout = COMMAND_TIMEOUT_MS,
   onHeartbeat?: (output: string, elapsedMs: number) => void | Promise<void>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxOutputChars = LOG_TAIL_CHARS * 4
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     let settled = false;
@@ -383,8 +407,8 @@ function runCommand(
 
     const appendOutput = (chunk: Buffer) => {
       output += chunk.toString();
-      if (output.length > LOG_TAIL_CHARS * 4) {
-        output = output.slice(output.length - LOG_TAIL_CHARS * 4);
+      if (output.length > maxOutputChars) {
+        output = output.slice(output.length - maxOutputChars);
       }
     };
 
@@ -720,6 +744,934 @@ async function waitForHttp(name: string, urls: string[], timeoutMs = HEALTH_TIME
   };
 }
 
+function frontendBaseUrls() {
+  return [`http://127.0.0.1:${getFrontendPort()}/`, `http://localhost:${getFrontendPort()}/`];
+}
+
+const PREPARED_MEDIA_MANIFEST_RELATIVE_PATH = path.join('frontend', 'public', 'assets', 'generated-media', 'media-manifest.json');
+
+function backendBaseUrls() {
+  return [`http://127.0.0.1:${getBackendPort()}/`, `http://localhost:${getBackendPort()}/`];
+}
+
+function urlWithPath(baseUrl: string, route: string) {
+  return new URL(route.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function safeArtifactName(value: string) {
+  return value.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'artifact';
+}
+
+async function fetchFirstOk(urls: string[], signal?: AbortSignal) {
+  let lastMessage = '';
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      const body = await response.text();
+      if (response.ok) {
+        return { ok: true as const, url, status: response.status, body };
+      }
+      lastMessage = `${url} returned ${response.status}: ${truncate(body, 800)}`;
+    } catch (error) {
+      lastMessage = `${url}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  return { ok: false as const, url: urls[0] || '', status: 0, body: '', message: lastMessage || 'No URL returned a successful response.' };
+}
+
+async function hasGeneratedProductContract(codeDir: string) {
+  return (
+    (await pathExists(path.join(codeDir, 'frontend', 'app', 'products'))) ||
+    (await generatedProjectMentions(codeDir, /\/api\/products|api\/products|\/products\/\{|\bproducts\/\[id\]/i))
+  );
+}
+
+type PreparedMediaManifest = {
+  assets?: Partial<PreparedMediaAsset>[];
+};
+
+function isPreparedMediaAsset(value: Partial<PreparedMediaAsset>): value is PreparedMediaAsset {
+  return Boolean(value.title && value.path && value.publicUrl && value.sourceImageUrl && value.mimeType && typeof value.sizeBytes === 'number');
+}
+
+async function readPreparedMediaAssetsManifest(codeDir: string) {
+  const manifest = await readJsonFile<PreparedMediaManifest>(path.join(codeDir, PREPARED_MEDIA_MANIFEST_RELATIVE_PATH));
+  return (manifest?.assets ?? []).filter(isPreparedMediaAsset);
+}
+
+function preparedMediaAssetReferences(assets: PreparedMediaAsset[]) {
+  return Array.from(
+    new Set(
+      assets.flatMap((asset) => [
+        asset.publicUrl,
+        encodeURI(asset.publicUrl),
+        asset.path.replace(/^frontend\/public/u, '').replace(/\\/g, '/')
+      ])
+    )
+  ).filter(Boolean);
+}
+
+function containsAnyTextReference(output: string, references: string[]) {
+  const haystack = output.toLowerCase();
+  return references.some((reference) => haystack.includes(reference.toLowerCase()));
+}
+
+function configuredBrowserExecutableCandidates() {
+  return [
+    process.env.GENERATED_BROWSER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
+    process.env.BROWSER,
+    process.platform === 'win32' && process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
+    process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '',
+    process.platform === 'darwin' ? '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' : '',
+    'google-chrome',
+    'google-chrome-stable',
+    'chromium',
+    'chromium-browser',
+    'microsoft-edge',
+    'msedge'
+  ].filter((value): value is string => Boolean(value?.trim()));
+}
+
+function looksLikeFilePath(value: string) {
+  return path.isAbsolute(value) || /[\\/]/.test(value);
+}
+
+async function findHeadlessBrowserExecutable() {
+  for (const candidate of configuredBrowserExecutableCandidates()) {
+    if (looksLikeFilePath(candidate)) {
+      if (await pathExists(candidate)) return candidate;
+      continue;
+    }
+
+    const probe = await runCommand(candidate, ['--version'], process.cwd(), 10_000, undefined, undefined, 2_000);
+    if (probe.ok) return candidate;
+  }
+
+  return null;
+}
+
+function extractVisibleTextFromHtml(html: string) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractDomEvidence(output: string) {
+  const marker = 'DOM evidence:\n';
+  const markerIndex = output.indexOf(marker);
+  if (markerIndex < 0) return null;
+
+  try {
+    return JSON.parse(output.slice(markerIndex + marker.length)) as {
+      text?: string;
+      html?: string;
+      productLinks?: string[];
+      images?: Array<{ src?: string; alt?: string }>;
+    };
+  } catch {
+    return null;
+  }
+}
+
+function browserRuntimeFindings(
+  output: string,
+  options?: { expectProductList?: boolean; expectProductDetail?: boolean; preparedAssetReferences?: string[] }
+) {
+  const domEvidence = extractDomEvidence(output);
+  const visibleText = domEvidence?.text || output;
+  const domSearchText = [domEvidence?.text, domEvidence?.html, JSON.stringify(domEvidence?.images ?? []), output].filter(Boolean).join('\n');
+  const findings = [...frontendRuntimeFindings(visibleText)];
+  const checks = [
+    { pattern: /blocked by CORS policy|no ['"]access-control-allow-origin['"] header|access to fetch at .* from origin/i, message: 'browser reported a CORS-blocked frontend API request' },
+    { pattern: /TypeError:\s*Failed to fetch|Failed to fetch|net::ERR_FAILED|net::ERR_CONNECTION_REFUSED/i, message: 'browser reported a failed frontend network request' },
+    { pattern: /Uncaught \(in promise\)|RuntimeError|ReferenceError/i, message: 'browser console reported a runtime JavaScript error' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(output)) findings.push(check.message);
+  }
+
+  if (options?.expectProductList) {
+    if (/picsum\.photos|placehold\.co|via\.placeholder|placeholder\.com|dummyimage|loremflickr|source\.unsplash\.com\/random/i.test(domSearchText)) {
+      findings.push('browser DOM uses generic placeholder image services instead of product-relevant/mockup-relevant imagery');
+    }
+
+    const hasProductDetailLink = Boolean(domEvidence?.productLinks?.length) || /href=["'][^"']*\/products\/[^"']+["']/i.test(domSearchText);
+    const hasProductCommerceSignal = /\$[0-9][0-9,.]*|view details|add to cart|product card|price/i.test(visibleText);
+    if (!hasProductDetailLink && !hasProductCommerceSignal) {
+      findings.push('browser DOM did not show product cards, product prices, or product-detail navigation after hydration');
+    }
+  }
+
+  if (options?.expectProductDetail) {
+    if (/picsum\.photos|placehold\.co|via\.placeholder|placeholder\.com|dummyimage|loremflickr|source\.unsplash\.com\/random/i.test(domSearchText)) {
+      findings.push('browser DOM uses generic placeholder image services instead of product-relevant/mockup-relevant imagery');
+    }
+
+    const hasDetailSignal = /\$[0-9][0-9,.]*|add to cart|specifications?|description|movement|calibre|details/i.test(visibleText);
+    if (!hasDetailSignal) {
+      findings.push('browser DOM did not show product detail content after hydration');
+    }
+  }
+
+  if ((options?.expectProductList || options?.expectProductDetail) && options.preparedAssetReferences?.length) {
+    if (!containsAnyTextReference(domSearchText, options.preparedAssetReferences)) {
+      findings.push('browser DOM does not use prepared local media assets from /assets/generated-media');
+    }
+  }
+
+  return Array.from(new Set(findings));
+}
+
+function getFreeTcpPort() {
+  return new Promise<number>((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(port);
+      });
+    });
+  });
+}
+
+async function fetchJsonWithRetry<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  const startedAt = Date.now();
+  let lastError = '';
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) throw new Error('Run canceled by user.');
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      if (response.ok) return (await response.json()) as T;
+      lastError = `${url} returned ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    await abortableDelay(250, signal);
+  }
+
+  throw new Error(lastError || `Timed out waiting for ${url}.`);
+}
+
+type CdpMessage = {
+  id?: number;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: { message?: string };
+};
+
+type CdpEvent = {
+  method: string;
+  params?: unknown;
+};
+
+class CdpSession {
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private events: CdpEvent[] = [];
+
+  private constructor(private readonly ws: WebSocket) {}
+
+  static connect(url: string) {
+    return new Promise<CdpSession>((resolve, reject) => {
+      if (typeof WebSocket !== 'function') {
+        reject(new Error('Global WebSocket is not available in this Node runtime.'));
+        return;
+      }
+
+      const ws = new WebSocket(url);
+      const session = new CdpSession(ws);
+
+      ws.addEventListener('open', () => resolve(session), { once: true });
+      ws.addEventListener('error', () => reject(new Error('Could not connect to Chrome DevTools Protocol.')), { once: true });
+      ws.addEventListener('message', (event) => session.handleMessage(event));
+      ws.addEventListener('close', () => session.rejectPending(new Error('Chrome DevTools Protocol connection closed.')));
+    });
+  }
+
+  send<T = unknown>(method: string, params?: Record<string, unknown>) {
+    const id = this.nextId;
+    this.nextId += 1;
+
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: (value) => resolve(value as T), reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  getEvents() {
+    return this.events.slice();
+  }
+
+  close() {
+    this.ws.close();
+  }
+
+  private handleMessage(event: MessageEvent) {
+    let message: CdpMessage;
+    try {
+      message = JSON.parse(String(event.data)) as CdpMessage;
+    } catch {
+      return;
+    }
+
+    if (typeof message.id === 'number') {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message || 'Chrome DevTools command failed.'));
+      else pending.resolve(message.result);
+      return;
+    }
+
+    if (message.method) {
+      this.events.push({ method: message.method, params: message.params });
+    }
+  }
+
+  private rejectPending(error: Error) {
+    for (const pending of Array.from(this.pending.values())) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+}
+
+function formatCdpEvents(events: CdpEvent[]) {
+  const lines: string[] = [];
+
+  for (const event of events) {
+    const params = event.params as Record<string, unknown> | undefined;
+    if (event.method === 'Runtime.consoleAPICalled') {
+      const args = Array.isArray(params?.args)
+        ? (params?.args as Array<Record<string, unknown>>).map((arg) => String(arg.value ?? arg.description ?? '')).filter(Boolean).join(' ')
+        : '';
+      if (args) lines.push(`console: ${args}`);
+    } else if (event.method === 'Runtime.exceptionThrown') {
+      const details = params?.exceptionDetails as Record<string, unknown> | undefined;
+      lines.push(`exception: ${String(details?.text || details?.exception || 'runtime exception')}`);
+    } else if (event.method === 'Log.entryAdded') {
+      const entry = params?.entry as Record<string, unknown> | undefined;
+      lines.push(`log: ${String(entry?.level || '')} ${String(entry?.text || '')}`);
+    } else if (event.method === 'Network.loadingFailed') {
+      lines.push(`network failed: ${String(params?.errorText || '')} ${String(params?.blockedReason || '')} ${String(params?.type || '')}`);
+    } else if (event.method === 'Network.responseReceived') {
+      const response = params?.response as Record<string, unknown> | undefined;
+      const status = Number(response?.status || 0);
+      const url = String(response?.url || '');
+      if (status >= 400 && (/\/api\/|_next\/image|\/products?/i.test(url))) {
+        lines.push(`network ${status}: ${url}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function waitForChromeTarget(port: number, signal?: AbortSignal) {
+  type ChromeTarget = { type?: string; webSocketDebuggerUrl?: string; url?: string };
+  const targets = await fetchJsonWithRetry<ChromeTarget[]>(`http://127.0.0.1:${port}/json/list`, 15_000, signal);
+  const page = targets.find((target) => target.type === 'page' && target.webSocketDebuggerUrl) || targets.find((target) => target.webSocketDebuggerUrl);
+  if (!page?.webSocketDebuggerUrl) throw new Error('Chrome DevTools target did not expose a websocket debugger URL.');
+  return page.webSocketDebuggerUrl;
+}
+
+async function collectBrowserPageEvidence(params: {
+  browser: string;
+  url: string;
+  codeDir: string;
+  logDir: string;
+  artifactName: string;
+  signal?: AbortSignal;
+}) {
+  const port = await getFreeTcpPort();
+  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), `${params.artifactName}-profile-`));
+  const screenshotFile = path.join(params.logDir, `${params.artifactName}.png`);
+  const args = [
+    '--headless=new',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--hide-scrollbars',
+    '--no-first-run',
+    '--no-default-browser-check',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profileDir}`,
+    '--window-size=1200,1600',
+    'about:blank'
+  ];
+  const child = spawn(params.browser, args, { cwd: params.codeDir, windowsHide: true });
+  let processOutput = '';
+
+  child.stdout?.on('data', (chunk: Buffer) => {
+    processOutput += chunk.toString();
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    processOutput += chunk.toString();
+  });
+
+  let session: CdpSession | null = null;
+  try {
+    const websocketUrl = await waitForChromeTarget(port, params.signal);
+    session = await CdpSession.connect(websocketUrl);
+    await session.send('Page.enable');
+    await session.send('Runtime.enable');
+    await session.send('Network.enable');
+    await session.send('Log.enable');
+    await session.send('Page.navigate', { url: params.url });
+    await abortableDelay(getBrowserValidationVirtualTimeBudgetMs(), params.signal);
+
+    const evaluation = await session.send<{ result?: { value?: unknown } }>('Runtime.evaluate', {
+      expression: `(() => {
+        const text = document.body ? document.body.innerText : '';
+        const html = document.documentElement ? document.documentElement.outerHTML : '';
+        const productLinks = Array.from(document.querySelectorAll('a[href*="/products/"]')).map((node) => node.href);
+        const images = Array.from(document.images).map((image) => ({
+          src: image.currentSrc || image.src,
+          alt: image.alt,
+          complete: image.complete,
+          naturalWidth: image.naturalWidth,
+          naturalHeight: image.naturalHeight
+        }));
+        return {
+          url: location.href,
+          title: document.title,
+          text,
+          bodyLength: text.length,
+          productLinks,
+          brokenImages: images.filter((image) => !image.complete || image.naturalWidth === 0).slice(0, 10),
+          imageCount: images.length,
+          html: html.slice(0, 120000)
+        };
+      })()`,
+      returnByValue: true,
+      awaitPromise: true
+    });
+    const screenshot = await session.send<{ data?: string }>('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    if (screenshot.data) await fs.writeFile(screenshotFile, screenshot.data, 'base64');
+
+    return {
+      command: `${params.browser} ${args.join(' ')}`,
+      screenshotFile,
+      output: [
+        `URL: ${params.url}`,
+        `Screenshot: ${screenshotFile}`,
+        `Browser process output:\n${processOutput}`,
+        `CDP events:\n${formatCdpEvents(session.getEvents())}`,
+        `DOM evidence:\n${JSON.stringify(evaluation.result?.value ?? {}, null, 2)}`
+      ].join('\n\n')
+    };
+  } finally {
+    session?.close();
+    child.kill();
+    await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function validateBrowserRenderedPage(params: {
+  name: string;
+  url: string;
+  codeDir: string;
+  logDir: string;
+  signal?: AbortSignal;
+  expectProductList?: boolean;
+  expectProductDetail?: boolean;
+  preparedAssetReferences?: string[];
+}): Promise<GeneratedValidationStep> {
+  if (!shouldRunBrowserValidation()) {
+    return skippedStep(params.name, 'VALIDATE_GENERATED_BROWSER=false; browser hydration validation was skipped.');
+  }
+
+  const browser = await findHeadlessBrowserExecutable();
+  if (!browser) {
+    return skippedStep(
+      params.name,
+      'No Chrome/Chromium/Edge executable was found, so browser hydration validation was skipped. Set GENERATED_BROWSER_EXECUTABLE_PATH to enable this check.'
+    );
+  }
+
+  await fs.mkdir(params.logDir, { recursive: true });
+  const artifactName = safeArtifactName(params.name);
+  let evidence: { command: string; screenshotFile: string; output: string };
+  try {
+    evidence = await collectBrowserPageEvidence({
+      browser,
+      url: params.url,
+      codeDir: params.codeDir,
+      logDir: params.logDir,
+      artifactName,
+      signal: params.signal
+    });
+  } catch (error) {
+    const logFile = await writeLog(params.logDir, `${artifactName}-browser-error`, error instanceof Error ? error.message : String(error));
+    return {
+      name: params.name,
+      status: 'FAIL',
+      command: `${browser} --headless=new --remote-debugging-port=<dynamic> ${params.url}`,
+      logFile,
+      message: `Headless browser validation failed for ${params.url}. ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const logFile = await writeLog(params.logDir, `${artifactName}-browser-evidence`, evidence.output);
+
+  const findings = browserRuntimeFindings(evidence.output, {
+    expectProductList: params.expectProductList,
+    expectProductDetail: params.expectProductDetail,
+    preparedAssetReferences: params.preparedAssetReferences
+  });
+
+  return findings.length > 0
+    ? {
+        name: params.name,
+        status: 'FAIL',
+        command: evidence.command,
+        logFile,
+        message: `Browser-rendered page failed after hydration at ${params.url}. Screenshot: ${evidence.screenshotFile}. Findings: ${findings.join('; ')}.`
+      }
+    : {
+        name: params.name,
+        status: 'PASS',
+        command: evidence.command,
+        logFile,
+        message: `Browser-rendered page passed after hydration at ${params.url}. Screenshot: ${evidence.screenshotFile}.`
+      };
+}
+
+const GENERATED_SCAN_EXTENSIONS = new Set([
+  '.css',
+  '.env',
+  '.example',
+  '.html',
+  '.js',
+  '.json',
+  '.jsx',
+  '.md',
+  '.mjs',
+  '.py',
+  '.ts',
+  '.tsx',
+  '.txt',
+  '.yaml',
+  '.yml'
+]);
+
+function shouldScanGeneratedTextFile(filePath: string) {
+  const name = path.basename(filePath).toLowerCase();
+  if (name === 'dockerfile' || name === 'containerfile' || name === '.env.example') return true;
+  return GENERATED_SCAN_EXTENSIONS.has(path.extname(name));
+}
+
+function shouldScanPreparedMediaUsageFile(filePath: string) {
+  const relativePath = filePath.replace(/\\/g, '/').toLowerCase();
+  if (relativePath.endsWith('/assets/generated-media/media-manifest.json')) return false;
+
+  return ['.css', '.html', '.js', '.json', '.jsx', '.mjs', '.py', '.ts', '.tsx'].includes(path.extname(filePath).toLowerCase());
+}
+
+async function generatedProjectContainsAnyPreparedMediaReference(dir: string, references: string[]): Promise<boolean> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (shouldSkipWorkspaceEntry(entry.name)) continue;
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (await generatedProjectContainsAnyPreparedMediaReference(entryPath, references)) return true;
+    } else if (entry.isFile() && shouldScanPreparedMediaUsageFile(entryPath)) {
+      try {
+        const stat = await fs.stat(entryPath);
+        if (stat.size > 1_000_000) continue;
+        if (containsAnyTextReference(await fs.readFile(entryPath, 'utf-8'), references)) return true;
+      } catch {
+        // Ignore unreadable generated files and continue scanning the rest.
+      }
+    }
+  }
+
+  return false;
+}
+
+async function validatePreparedMediaAssetUsage(codeDir: string, preparedAssets: PreparedMediaAsset[]): Promise<GeneratedValidationStep> {
+  if (preparedAssets.length === 0) {
+    return skippedStep('frontend prepared media usage smoke', 'No prepared local media asset manifest was found.');
+  }
+
+  const references = preparedMediaAssetReferences(preparedAssets);
+  const used = references.length > 0 && (await generatedProjectContainsAnyPreparedMediaReference(codeDir, references));
+
+  return used
+    ? {
+        name: 'frontend prepared media usage smoke',
+        status: 'PASS',
+        command: `scan generated project source for ${preparedAssets.length} prepared /assets/generated-media reference(s)`,
+        message: `Generated project source references prepared local media assets: ${preparedAssets.map((asset) => asset.publicUrl).join(', ')}`
+      }
+    : {
+        name: 'frontend prepared media usage smoke',
+        status: 'FAIL',
+        command: `scan generated project source for ${preparedAssets.length} prepared /assets/generated-media reference(s)`,
+        message:
+          'Prepared local media assets were downloaded for the run, but generated project source does not reference any /assets/generated-media URL. Use the provided local publicUrl values in frontend code or backend seed data instead of placeholders or unrelated remote images.'
+      };
+}
+
+async function generatedProjectMentions(dir: string, pattern: RegExp): Promise<boolean> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (shouldSkipWorkspaceEntry(entry.name)) continue;
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (await generatedProjectMentions(entryPath, pattern)) return true;
+    } else if (entry.isFile() && shouldScanGeneratedTextFile(entryPath)) {
+      try {
+        const stat = await fs.stat(entryPath);
+        if (stat.size > 1_000_000) continue;
+        if (pattern.test(await fs.readFile(entryPath, 'utf-8'))) return true;
+      } catch {
+        // Ignore unreadable generated files; other validation steps will catch concrete runtime failures.
+      }
+    }
+  }
+
+  return false;
+}
+
+function frontendRuntimeFindings(html: string) {
+  const findings: string[] = [];
+  const checks = [
+    { pattern: /unable to load (?:products|items|data)|failed to fetch (?:products|items|data)|error fetching (?:products|items|data)/i, message: 'frontend rendered a data/API failure message' },
+    { pattern: /404\s+this page could not be found|this page could not be found/i, message: 'frontend rendered a Next.js 404 page' },
+    { pattern: /hydration failed|application error|runtime error/i, message: 'frontend rendered a runtime error state' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(html)) findings.push(check.message);
+  }
+
+  return findings;
+}
+
+function extractNextImageUrls(html: string, baseUrl: string) {
+  const urls = new Set<string>();
+  const matches = Array.from(html.matchAll(/\/_next\/image\?[^"'<>\s,)]+/gi));
+
+  for (const match of matches) {
+    const raw = match[0].replace(/&amp;/g, '&').replace(/&#x26;/g, '&');
+    try {
+      urls.add(new URL(raw, baseUrl).toString());
+    } catch {
+      // Ignore malformed candidates; they will be represented by broken UI checks where applicable.
+    }
+  }
+
+  return Array.from(urls);
+}
+
+async function validateNextImageUrls(name: string, html: string, baseUrl: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  const imageUrls = extractNextImageUrls(html, baseUrl).slice(0, 5);
+  if (imageUrls.length === 0) {
+    return skippedStep(name, 'No Next.js image optimizer URLs were found in the rendered page.');
+  }
+
+  const failures: string[] = [];
+  for (const url of imageUrls) {
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      if (!response.ok) {
+        const body = await response.text();
+        failures.push(`${url} returned ${response.status}: ${truncate(body, 500)}`);
+      }
+    } catch (error) {
+      failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return failures.length > 0
+    ? {
+        name,
+        status: 'FAIL',
+        command: imageUrls.map((url) => `GET ${url}`).join(' && '),
+        message: `Rendered Next.js images must load successfully. Failures:\n${failures.join('\n')}`
+      }
+    : {
+        name,
+        status: 'PASS',
+        command: imageUrls.map((url) => `GET ${url}`).join(' && '),
+        message: `Validated ${imageUrls.length} rendered Next.js image optimizer URL(s).`
+      };
+}
+
+async function validateBackendProductApi(codeDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  if (!(await hasGeneratedProductContract(codeDir))) {
+    return skippedStep('backend product API smoke', 'No generated product API or product detail route contract was detected.');
+  }
+
+  const urls = backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products'));
+  const response = await fetchFirstOk(urls, signal);
+  if (!response.ok) {
+    return {
+      name: 'backend product API smoke',
+      status: 'FAIL',
+      command: urls.map((url) => `GET ${url}`).join(' || '),
+      message: `Generated files reference a product API, but /api/products is not reachable. ${response.message}`
+    };
+  }
+
+  try {
+    const data = JSON.parse(response.body);
+    if (!Array.isArray(data) || data.length === 0) {
+      return {
+        name: 'backend product API smoke',
+        status: 'FAIL',
+        command: `GET ${response.url}`,
+        message: '/api/products must return a non-empty JSON array when product listing/detail UI is generated.'
+      };
+    }
+  } catch {
+    return {
+      name: 'backend product API smoke',
+      status: 'FAIL',
+      command: `GET ${response.url}`,
+      message: `/api/products returned non-JSON content: ${truncate(response.body, 500)}`
+    };
+  }
+
+  return {
+    name: 'backend product API smoke',
+    status: 'PASS',
+    command: `GET ${response.url}`,
+    message: '/api/products returned a non-empty JSON array.'
+  };
+}
+
+async function validateBackendCorsForFrontendOrigins(codeDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  if (!(await hasGeneratedProductContract(codeDir))) {
+    return skippedStep('backend CORS browser-origin smoke', 'No generated browser product/API contract was detected.');
+  }
+
+  const apiUrls = backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products'));
+  const frontendOrigins = Array.from(new Set(frontendBaseUrls().map((baseUrl) => new URL(baseUrl).origin)));
+  const failures: string[] = [];
+  const passes: string[] = [];
+
+  for (const origin of frontendOrigins) {
+    let originPassed = false;
+    const originFailures: string[] = [];
+
+    for (const apiUrl of apiUrls) {
+      try {
+        const response = await fetch(apiUrl, {
+          cache: 'no-store',
+          headers: { Origin: origin },
+          signal
+        });
+        const allowOrigin = response.headers.get('access-control-allow-origin');
+        if (response.ok && (allowOrigin === origin || allowOrigin === '*')) {
+          passes.push(`${origin} -> ${apiUrl} allowed by ${allowOrigin}`);
+          originPassed = true;
+          break;
+        }
+
+        originFailures.push(`${origin} -> ${apiUrl} returned ${response.status} with access-control-allow-origin=${allowOrigin || '(missing)'}`);
+      } catch (error) {
+        originFailures.push(`${origin} -> ${apiUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (!originPassed) {
+      failures.push(...originFailures);
+      failures.push(`Generated backend does not allow browser origin ${origin} for /api/products.`);
+    }
+  }
+
+  return failures.length > 0
+    ? {
+        name: 'backend CORS browser-origin smoke',
+        status: 'FAIL',
+        command: frontendOrigins.map((origin) => `GET /api/products Origin:${origin}`).join(' && '),
+        message: `Backend API must allow the generated frontend origins used by browser validation. Failures:\n${failures.join('\n')}`
+      }
+    : {
+        name: 'backend CORS browser-origin smoke',
+        status: 'PASS',
+        command: frontendOrigins.map((origin) => `GET /api/products Origin:${origin}`).join(' && '),
+        message: `Backend CORS allows generated frontend origins:\n${passes.join('\n')}`
+      };
+}
+
+function extractFirstProductDetailPath(html: string) {
+  const match = html.match(/href=["'](\/products\/[^"']+)["']/i);
+  return match?.[1] || '/products/1';
+}
+
+async function validateFrontendRuntimeSmoke(codeDir: string, logDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep[]> {
+  const steps: GeneratedValidationStep[] = [];
+  const homeUrls = frontendBaseUrls();
+  const preparedMediaAssets = await readPreparedMediaAssetsManifest(codeDir);
+  const preparedAssetReferences = preparedMediaAssetReferences(preparedMediaAssets);
+  const home = await fetchFirstOk(homeUrls, signal);
+
+  if (!home.ok) {
+    return [
+      {
+        name: 'frontend rendered content smoke',
+        status: 'FAIL',
+        command: homeUrls.map((url) => `GET ${url}`).join(' || '),
+        message: `Frontend route did not return usable HTML. ${home.message}`
+      }
+    ];
+  }
+
+  const homeFindings = frontendRuntimeFindings(extractVisibleTextFromHtml(home.body));
+  steps.push(
+    homeFindings.length > 0
+      ? {
+          name: 'frontend rendered content smoke',
+          status: 'FAIL',
+          command: `GET ${home.url}`,
+          message: `Frontend returned 200 but rendered blocking runtime/data failure(s): ${homeFindings.join('; ')}.`
+        }
+      : {
+          name: 'frontend rendered content smoke',
+          status: 'PASS',
+          command: `GET ${home.url}`,
+          message: 'Frontend home route returned 200 without obvious runtime/data failure text.'
+        }
+  );
+
+  steps.push(await validateNextImageUrls('frontend home image smoke', home.body, home.url, signal));
+  steps.push(await validatePreparedMediaAssetUsage(codeDir, preparedMediaAssets));
+
+  const hasProductDetailRoute = (await hasGeneratedProductContract(codeDir)) || /href=["']\/products\//i.test(home.body);
+  steps.push(
+    await validateBrowserRenderedPage({
+      name: 'frontend browser home smoke',
+      url: home.url,
+      codeDir,
+      logDir,
+      signal,
+      expectProductList: hasProductDetailRoute,
+      preparedAssetReferences
+    })
+  );
+
+  if (!hasProductDetailRoute) {
+    steps.push(skippedStep('frontend product detail smoke', 'No generated product detail route was detected.'));
+    return steps;
+  }
+
+  const detailPath = extractFirstProductDetailPath(home.body);
+  const detailUrls = frontendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, detailPath));
+  const detail = await fetchFirstOk(detailUrls, signal);
+  if (!detail.ok) {
+    steps.push({
+      name: 'frontend product detail smoke',
+      status: 'FAIL',
+      command: detailUrls.map((url) => `GET ${url}`).join(' || '),
+      message: `Generated product detail route is not reachable at ${detailPath}. ${detail.message}`
+    });
+    return steps;
+  }
+
+  const detailFindings = frontendRuntimeFindings(extractVisibleTextFromHtml(detail.body));
+  steps.push(
+    detailFindings.length > 0
+      ? {
+          name: 'frontend product detail smoke',
+          status: 'FAIL',
+          command: `GET ${detail.url}`,
+          message: `Product detail route returned 200 but rendered blocking runtime/data failure(s): ${detailFindings.join('; ')}.`
+        }
+      : {
+          name: 'frontend product detail smoke',
+          status: 'PASS',
+          command: `GET ${detail.url}`,
+          message: `Product detail route ${detailPath} returned 200 without obvious runtime/data failure text.`
+        }
+  );
+  steps.push(await validateNextImageUrls('frontend detail image smoke', detail.body, detail.url, signal));
+  steps.push(
+    await validateBrowserRenderedPage({
+      name: 'frontend browser product detail smoke',
+      url: detail.url,
+      codeDir,
+      logDir,
+      signal,
+      expectProductDetail: true,
+      preparedAssetReferences
+    })
+  );
+
+  return steps;
+}
+
+function runtimeLogFindings(output: string) {
+  const findings: string[] = [];
+  const checks = [
+    { pattern: /Error fetching (?:products|product|items|item|data)/i, message: 'frontend server logs contain generated data fetch errors' },
+    { pattern: /TypeError:\s*fetch failed/i, message: 'frontend server logs contain fetch failed errors' },
+    { pattern: /ECONNREFUSED[\s\S]{0,300}(?:localhost|127\.0\.0\.1):8000|(?:localhost|127\.0\.0\.1):8000[\s\S]{0,300}ECONNREFUSED/i, message: 'frontend container appears to call localhost for the backend instead of the Compose service name' },
+    { pattern: /url["']?\s+parameter is not allowed|INVALID_IMAGE_OPTIMIZE_REQUEST|upstream image response failed|ImageError/i, message: 'frontend server logs contain image optimization failures' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(output)) findings.push(check.message);
+  }
+
+  return findings;
+}
+
+async function validateRuntimeLogs(engine: ComposeEngine, codeDir: string, composeFile: string, logDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  const logs = await collectComposeLogsForEngine(engine, codeDir, composeFile, logDir, signal);
+  const findings = runtimeLogFindings(logs.output);
+
+  return findings.length > 0
+    ? {
+        name: `${engine.name} runtime log smoke`,
+        status: 'FAIL',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')}`,
+        logFile: logs.logFile,
+        message: `Runtime logs contain blocking generated-app failures: ${findings.join('; ')}.\n${truncate(logs.output, 2400)}`
+      }
+    : {
+        name: `${engine.name} runtime log smoke`,
+        status: 'PASS',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')}`,
+        logFile: logs.logFile,
+        message: 'Runtime logs do not contain known blocking generated-app fetch or image failures.'
+      };
+}
+
 async function collectComposeLogsForEngine(engine: ComposeEngine, codeDir: string, composeFile: string, logDir: string, signal?: AbortSignal) {
   const args = [...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'];
   if (engine.name === 'docker compose') args.splice(args.length - 1, 0, '--no-color');
@@ -779,6 +1731,9 @@ async function cleanupGeneratedComposeProject(
   }
 
   const args = [...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'down', '--remove-orphans'];
+  if (shouldRemoveGeneratedComposeVolumes()) {
+    args.push('--volumes');
+  }
   if (shouldRemoveGeneratedComposeImages()) {
     args.push('--rmi', 'local');
   }
@@ -798,9 +1753,13 @@ async function cleanupGeneratedComposeProject(
     ...step,
     message:
       step.status === 'PASS'
-        ? shouldRemoveGeneratedComposeImages()
-          ? 'Removed previous generated Compose containers, networks, orphans, and local generated images for this project name.'
-          : 'Removed previous generated Compose containers, networks, and orphans for this project name.'
+        ? [
+            'Removed previous generated Compose containers, networks, and orphans for this project name',
+            shouldRemoveGeneratedComposeVolumes() ? 'removed generated volumes to avoid stale SQLite/runtime data' : '',
+            shouldRemoveGeneratedComposeImages() ? 'removed local generated images' : ''
+          ]
+            .filter(Boolean)
+            .join('; ') + '.'
         : step.message
   };
 }
@@ -982,7 +1941,7 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
 
     const backendHealth = await waitForHttp(
       'backend health',
-      [`http://127.0.0.1:${getBackendPort()}/health`, `http://localhost:${getBackendPort()}/health`],
+      backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/health')),
       HEALTH_TIMEOUT_MS,
       onProgress,
       signal
@@ -991,7 +1950,7 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
 
     const frontendHealth = await waitForHttp(
       'frontend health',
-      [`http://127.0.0.1:${getFrontendPort()}/`, `http://localhost:${getFrontendPort()}/`],
+      frontendBaseUrls(),
       HEALTH_TIMEOUT_MS,
       onProgress,
       signal
@@ -1006,6 +1965,26 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
         command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')} && ${engine.command} ps/inspect`,
         logFile: logs.logFile,
         message: `Captured ${engine.name} logs and container health diagnostics after healthcheck failure.\n${truncate(logs.output, 2400)}`
+      });
+      return steps;
+    }
+
+    const runtimeSmokeSteps: GeneratedValidationStep[] = [
+      await validateBackendProductApi(codeDir, signal),
+      await validateBackendCorsForFrontendOrigins(codeDir, signal),
+      ...(await validateFrontendRuntimeSmoke(codeDir, logDir, signal)),
+      await validateRuntimeLogs(engine, codeDir, composeFile, logDir, signal)
+    ];
+    steps.push(...runtimeSmokeSteps);
+
+    if (runtimeSmokeSteps.some((step) => step.status === 'FAIL')) {
+      const logs = await collectComposeDiagnosticsForEngine(engine, codeDir, composeFile, logDir, signal);
+      steps.push({
+        name: `${engine.name} diagnostics`,
+        status: 'FAIL',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')} && ${engine.command} ps/inspect`,
+        logFile: logs.logFile,
+        message: `Captured ${engine.name} logs and container health diagnostics after runtime smoke failure.\n${truncate(logs.output, 2400)}`
       });
       return steps;
     }
@@ -1129,7 +2108,7 @@ function buildResult(params: {
   const allExecutionSkipped = executionSteps.length > 0 && executionSteps.every((step) => step.status === 'SKIPPED');
   const hasInfrastructureSkip = executionSteps.some((step) => step.status === 'SKIPPED' && /environment\/runtime issue|compose engine is unavailable|rancher\/docker is not ready/i.test(step.message));
   const findings = failedSteps.map((step) => `${step.name}: ${step.message}`);
-  const status = params.skipped || allExecutionSkipped || hasInfrastructureSkip ? 'SKIPPED' : failedSteps.length > 0 ? 'NEEDS_FIX' : 'PASS';
+  const status = failedSteps.length > 0 ? 'NEEDS_FIX' : params.skipped || allExecutionSkipped || hasInfrastructureSkip ? 'SKIPPED' : 'PASS';
 
   return {
     status,

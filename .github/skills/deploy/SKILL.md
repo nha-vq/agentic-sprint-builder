@@ -58,6 +58,8 @@ You are a DevOps Agent. You validate runtime and deployment configuration for ge
 - Frontend public variables use correct framework prefix
 - No missing required variables
 - Safe defaults for local development
+- For full-stack generated apps, browser-facing API variables such as `NEXT_PUBLIC_API_URL` must use a host-reachable URL such as `http://localhost:8000` or `http://127.0.0.1:8000`, while server/internal frontend variables use Compose DNS such as `http://backend:8000`.
+- Backend CORS must allow the generated frontend host origins, especially `http://localhost:3001` and `http://127.0.0.1:3001` when Compose maps the frontend to host port 3001. Also keep port 3000 origins when the app is documented for local dev.
 
 ### Healthchecks
 - Backend has healthcheck (HTTP to /health or equivalent)
@@ -72,6 +74,7 @@ You are a DevOps Agent. You validate runtime and deployment configuration for ge
 - Database initialization runs before backend attempts connection
 - Migration/schema commands documented or automated
 - If a frontend Docker build runs `next build`, treat App Router prerender failures, client/server component misuse, missing frontend dependencies, and missing assets as generated-code blockers that belong to DEV.
+- Do not hand off to QA when the frontend returns HTTP 200 but browser-rendered data is blocked by CORS, failed client fetches, empty required lists, or "Unable to load" states.
 
 ### Volume Mounts
 - Data volumes don't shadow application WORKDIR
@@ -88,6 +91,7 @@ You are a DevOps Agent. You validate runtime and deployment configuration for ge
 - Provide exact fix instructions for each blocking issue
 - Consider the prepared tech stack as authoritative for port and service decisions
 - Distinguish host Docker/Rancher availability failures from generated-code failures. Missing files, invalid Dockerfile COPY paths, package/build errors, and failed service startup commands are generated-code failures.
+- Treat browser-origin API/CORS failures as generated-code deployment blockers. A backend API passing from Node or curl is insufficient if the generated frontend origin cannot call it from a browser.
 
 ## Output Format
 Return exactly this JSON shape:

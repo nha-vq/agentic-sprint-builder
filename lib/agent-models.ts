@@ -19,12 +19,13 @@ export const AGENT_MODEL_OPTIONS: Array<{ value: (typeof AGENT_MODEL_IDS)[number
 export const DEFAULT_AGENT_MODELS: Record<AgentId, (typeof AGENT_MODEL_IDS)[number]> = {
   ba: 'google/gemini-2.5-flash',
   'tech-stack': 'anthropic/claude-sonnet-4.6',
+  ux: 'google/gemini-2.5-pro',
   dev: 'anthropic/claude-sonnet-4.6',
   'frontend-dev': 'anthropic/claude-sonnet-4.6',
   'backend-dev': 'anthropic/claude-sonnet-4.6',
   'integration-dev': 'anthropic/claude-sonnet-4.6',
-  'code-review': 'anthropic/claude-opus-4.7',
-  deploy: 'anthropic/claude-sonnet-4.6',
+  'code-review': 'anthropic/claude-sonnet-4.6',
+  deploy: 'google/gemini-2.5-flash',
   qa: 'google/gemini-2.5-flash'
 };
 

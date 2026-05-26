@@ -9,3 +9,13 @@ project-skills/*
 !project-skills/.gitkeep
 .runtime-logs
 .env
+
+# Local Codex/browser automation artifacts
+.codex*
+start-codex-chrome-debug.bat
+
+# Local dev server logs
+.next-dev*.log
+
+# Generated observation reports
+reports/*

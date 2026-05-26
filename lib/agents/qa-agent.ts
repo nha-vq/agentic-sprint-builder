@@ -1,8 +1,9 @@
 import { runMarkdownSkillAgent } from './base-agent';
+import { formatUXContractForPrompt } from './ux-agent';
 import { formatGeneratedProjectOverview, formatRunHistoryContext } from '@/lib/context/agent-context';
 import { extractJsonObject } from '@/lib/utils/json';
 import { z } from 'zod';
-import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, RunResult } from '@/lib/types';
+import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, RequirementImage, RunResult, UXContractOutput } from '@/lib/types';
 
 const QAReviewOutputSchema = z.object({
   status: z.enum(['PASS', 'NEEDS_FIX']),
@@ -55,7 +56,13 @@ function isQaRelevantFile(file: GeneratedFile) {
     name === 'pyproject.toml' ||
     name === 'dockerfile' ||
     name === 'containerfile' ||
+    name === 'next.config.js' ||
+    name === 'next.config.mjs' ||
+    name === 'tailwind.config.ts' ||
+    name === 'tailwind.config.js' ||
     /^(compose|docker-compose)\.ya?ml$/.test(name) ||
+    /^frontend\/(?:app|components|pages|src)\/.*\.(tsx|jsx|ts|js|css|scss)$/.test(normalized) ||
+    /^frontend\/(?:app|src)\/globals\.css$/.test(normalized) ||
     /(^|\/)(main|app|server|database|models|schemas|seed)[._-]?[a-z0-9]*\.(py|ts|tsx|js|jsx)$/.test(normalized) ||
     /(^|\/)(tests?|__tests__)\/|(\.|_)(test|spec)\./.test(normalized)
   );
@@ -106,10 +113,54 @@ function formatExecutionValidationSummary(validation: GeneratedExecutionValidati
   ].join('\n\n');
 }
 
+function formatRequirementImageContext(images?: RequirementImage[] | null) {
+  if (!images?.length) return 'No requirement images are attached.';
+  return [
+    `${images.length} requirement image(s) are attached to this QA review. Inspect them directly as visual mockup/source material.`,
+    ...images.map((image, index) => `- Image ${index + 1}: ${image.name} (${image.mimeType}, ${Math.round(image.sizeBytes / 1024)} KB)`)
+  ].join('\n');
+}
+
+function unique(values: string[]) {
+  return Array.from(new Set(values.filter((value) => value.trim())));
+}
+
+function enforceExecutionValidationGate(review: QAReviewOutput, validation?: GeneratedExecutionValidationResult): QAReviewOutput {
+  if (!validation || validation.status !== 'NEEDS_FIX') return review;
+
+  const failedSteps = validation.steps.filter((step) => step.status === 'FAIL');
+  const gateFindings = failedSteps.length
+    ? failedSteps.map((step) => `${step.name}: ${truncate(step.message, 600)}`)
+    : validation.findings.map((finding) => truncate(finding, 600));
+  const findings = unique([...gateFindings, ...review.findings]);
+  const fixInstructions = validation.fixInstructions.trim()
+    ? validation.fixInstructions
+    : review.fixInstructions.trim()
+      ? review.fixInstructions
+      : 'Fix the automated execution validation failures, then rerun QA.';
+  const reportAppendix = [
+    '## Automated Execution Gate',
+    '',
+    'QA status was forced to NEEDS_FIX because automated execution validation found blocking runtime evidence.',
+    '',
+    ...gateFindings.map((finding) => `- ${finding}`)
+  ].join('\n');
+
+  return {
+    ...review,
+    status: 'NEEDS_FIX',
+    findings,
+    fixInstructions,
+    report: review.report.includes('## Automated Execution Gate') ? review.report : `${review.report.trim()}\n\n${reportAppendix}`
+  };
+}
+
 function buildQaPrompt(input: {
   requirements: string;
   techSpec: string;
+  requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
+  uxContract?: UXContractOutput | null;
   baOutput: string;
   devOutput: DevOutput;
   existingFiles: GeneratedFile[];
@@ -132,8 +183,14 @@ ${truncate(input.requirements, input.compact ? 1_500 : 3_000)}
 TECH SPEC:
 ${truncate(input.techSpec, input.compact ? 1_000 : 2_000)}
 
+REQUIREMENT IMAGE CONTEXT:
+${formatRequirementImageContext(input.requirementImages)}
+
 PREPARED TECH STACK:
 ${input.preparedTechStack ? truncate(JSON.stringify(input.preparedTechStack, null, 2), input.compact ? 1_500 : 3_000) : 'Not provided.'}
+
+STABLE UX/UI CONTRACT:
+${truncate(formatUXContractForPrompt(input.uxContract), input.compact ? 2_000 : 4_000)}
 
 BA OUTPUT:
 ${truncate(input.baOutput, input.compact ? 2_000 : 4_000)}
@@ -158,7 +215,9 @@ ${truncate(formatRunHistoryContext(input.recentRuns), input.compact ? 3_000 : 5_
 export async function runQAAgent(input: {
   requirements: string;
   techSpec?: string | null;
+  requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
+  uxContract?: UXContractOutput | null;
   baOutput: string;
   devOutput: DevOutput;
   existingFiles?: GeneratedFile[];
@@ -180,11 +239,14 @@ export async function runQAAgent(input: {
           name: 'qa_review_output',
           schema: QAReviewJsonSchema
         },
+        images: input.requirementImages?.length ? input.requirementImages : undefined,
         signal: input.signal,
         userPrompt: buildQaPrompt({
           requirements: input.requirements,
           techSpec,
+          requirementImages: input.requirementImages,
           preparedTechStack: input.preparedTechStack,
+          uxContract: input.uxContract,
           baOutput: input.baOutput,
           devOutput: input.devOutput,
           existingFiles: input.existingFiles ?? [],
@@ -194,7 +256,7 @@ export async function runQAAgent(input: {
         })
       });
 
-      return QAReviewOutputSchema.parse(extractJsonObject(raw));
+      return enforceExecutionValidationGate(QAReviewOutputSchema.parse(extractJsonObject(raw)), input.executionValidation);
     } catch (error) {
       lastError = error;
       if (!isTruncationError(error) && attempt > 1) break;

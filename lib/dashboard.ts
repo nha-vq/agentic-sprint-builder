@@ -31,9 +31,18 @@ export interface DashboardIdentitySnapshot {
   created_at?: string;
   agents: DashboardAgentSnapshot[];
   agentIds: DashboardAgentIdMap;
+  warnings?: string[];
+  connectivity?: DashboardConnectivity;
   dashboardDisabled?: boolean;
   mocked?: boolean;
   reused?: boolean;
+}
+
+export interface DashboardConnectivity {
+  checked: boolean;
+  reachable: boolean;
+  status?: number;
+  error?: string;
 }
 
 const AGENTS: DashboardAgentDefinition[] = [
@@ -47,7 +56,13 @@ const AGENTS: DashboardAgentDefinition[] = [
     agent_id: 'tech-stack',
     name: 'TA Agent',
     role: 'technical_architect',
-    description: 'Analyzes the tech stack, prepares architecture decisions, and upgrades the DEV skill before implementation and repairs.'
+    description: 'Analyzes the tech stack, prepares architecture decisions, and updates TA DEV context before implementation and repairs.'
+  },
+  {
+    agent_id: 'ux',
+    name: 'UX Agent',
+    role: 'ux_designer',
+    description: 'Creates a stable UX/UI contract from requirements, mockups, BA output, and tech-stack decisions.'
   },
   {
     agent_id: 'dev',
@@ -113,6 +128,22 @@ function dashboardBaseUrl() {
   return process.env.DASHBOARD_BASE_URL || 'https://aitechcontest.kms-technology.com/api';
 }
 
+function getDashboardConnectivityTimeoutMs() {
+  const parsed = Number.parseInt(process.env.DASHBOARD_CONNECTIVITY_TIMEOUT_MS || '8000', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8_000;
+}
+
+function truncate(value: string, maxChars = 800) {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}...[truncated ${value.length - maxChars} chars]`;
+}
+
+function maskSecrets(value: string) {
+  return value
+    .replace(/(api[_-]?key|token|secret|password)(["'\s:=]+)([^"'\s]+)/gi, '$1$2[redacted]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer [redacted]');
+}
+
 function generateCompanyName(): string {
   return process.env.DASHBOARD_COMPANY_NAME || DEFAULT_DASHBOARD_COMPANY_NAME;
 }
@@ -164,6 +195,25 @@ function applyIdentityToProcessEnv(identity: DashboardIdentity) {
 
 /** In-memory dashboard identity cache so registration is stable per process. */
 let cachedIdentity: DashboardIdentity | null = null;
+let dashboardEventFailureLogs = 0;
+let dashboardRemoteEventsDisabledReason: string | null = null;
+const MAX_DASHBOARD_EVENT_FAILURE_LOGS = 5;
+
+export function isDashboardRequired() {
+  return process.env.DASHBOARD_REQUIRED === 'true' || process.env.DASHBOARD_OPTIONAL === 'false';
+}
+
+export function shouldAutoRegisterDashboard() {
+  return process.env.DASHBOARD_AUTO_REGISTER === 'true';
+}
+
+export function disableDashboardRemoteEvents(reason: string) {
+  dashboardRemoteEventsDisabledReason = reason;
+}
+
+export function enableDashboardRemoteEvents() {
+  dashboardRemoteEventsDisabledReason = null;
+}
 
 export function getDashboardCompanyId(): string | null {
   return cachedIdentity?.company_id || process.env.DASHBOARD_COMPANY_ID || null;
@@ -198,6 +248,14 @@ function existingIdentityFromEnv(): DashboardIdentity | null {
 
 function toDashboardIdentitySnapshot(identity?: DashboardIdentity | null): DashboardIdentitySnapshot {
   const agentIds = identity?.agents || readAgentIdsFromEnv();
+  const missingAgents = AGENTS.filter((agent) => !agentIds[agent.agent_id]).map((agent) => agent.agent_id);
+  const logicalFallbackAgents = AGENTS.filter((agent) => agentIds[agent.agent_id] === agent.agent_id).map((agent) => agent.agent_id);
+  const warnings = [
+    ...(isDashboardEnabled() && !(identity?.company_id || process.env.DASHBOARD_COMPANY_ID) ? ['Dashboard is enabled but no company id is configured.'] : []),
+    ...(missingAgents.length ? [`Missing dashboard agent id(s): ${missingAgents.join(', ')}.`] : []),
+    ...(logicalFallbackAgents.length ? [`Some agents use logical ids instead of remote ids: ${logicalFallbackAgents.join(', ')}.`] : [])
+  ];
+
   return {
     dashboardEnabled: isDashboardEnabled(),
     company_id: identity?.company_id || process.env.DASHBOARD_COMPANY_ID || null,
@@ -209,6 +267,7 @@ function toDashboardIdentitySnapshot(identity?: DashboardIdentity | null): Dashb
       created: Boolean(agentIds[agent.agent_id])
     })),
     agentIds,
+    warnings,
     dashboardDisabled: identity?.dashboardDisabled,
     mocked: identity?.mocked,
     reused: identity?.reused
@@ -217,6 +276,74 @@ function toDashboardIdentitySnapshot(identity?: DashboardIdentity | null): Dashb
 
 export function getDashboardIdentitySnapshot(): DashboardIdentitySnapshot {
   return toDashboardIdentitySnapshot(cachedIdentity || existingIdentityFromEnv());
+}
+
+export async function checkDashboardConnectivity(): Promise<DashboardConnectivity> {
+  if (!isDashboardEnabled()) {
+    return { checked: false, reachable: false, error: 'Dashboard is disabled.' };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), getDashboardConnectivityTimeoutMs());
+
+  try {
+    const response = await fetch(dashboardBaseUrl(), {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal
+    });
+
+    return {
+      checked: true,
+      reachable: true,
+      status: response.status
+    };
+  } catch (error) {
+    return {
+      checked: true,
+      reachable: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function getDashboardIdentitySnapshotWithConnectivity(): Promise<DashboardIdentitySnapshot> {
+  const snapshot = getDashboardIdentitySnapshot();
+  if (!snapshot.dashboardEnabled) return snapshot;
+
+  const connectivity = await checkDashboardConnectivity();
+  return {
+    ...snapshot,
+    connectivity,
+    warnings: [
+      ...(snapshot.warnings || []),
+      ...(!connectivity.reachable ? [`Dashboard API is not reachable at ${dashboardBaseUrl()}: ${connectivity.error || 'unknown connection error'}.`] : [])
+    ]
+  };
+}
+
+export function validateDashboardReadiness() {
+  const snapshot = getDashboardIdentitySnapshot();
+  if (!snapshot.dashboardEnabled) {
+    return {
+      ok: true,
+      dashboardEnabled: false,
+      warnings: ['Dashboard is disabled. Events will remain local only.'],
+      snapshot
+    };
+  }
+
+  const warnings = snapshot.warnings || [];
+  const required = isDashboardRequired();
+  return {
+    ok: !required || warnings.length === 0,
+    dashboardEnabled: true,
+    dashboardRequired: required,
+    warnings,
+    snapshot
+  };
 }
 
 function extractStringField(value: unknown, fieldNames: string[]) {
@@ -323,6 +450,51 @@ async function deleteJson(url: string) {
   }
 
   return parsed;
+}
+
+function dashboardPath(template: string, values: { companyId: string; agentId?: string | null; toAgentId?: string | null }) {
+  return template
+    .replace('{company_id}', encodeURIComponent(values.companyId))
+    .replace('{agent_id}', encodeURIComponent(values.agentId || ''))
+    .replace('{to_agent_id}', encodeURIComponent(values.toAgentId || ''));
+}
+
+async function postDashboardEvent(paths: string[], body: Record<string, unknown>) {
+  const failures: Array<{ path: string; status?: number; response?: string; error?: string }> = [];
+
+  for (const pathTemplate of paths) {
+    const url = `${dashboardBaseUrl()}${pathTemplate}`;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const responseText = await response.text();
+      const safeResponse = truncate(maskSecrets(responseText || ''));
+
+      if (response.ok) {
+        return {
+          ok: true,
+          path: pathTemplate,
+          status: response.status,
+          response: safeResponse
+        };
+      }
+
+      failures.push({ path: pathTemplate, status: response.status, response: safeResponse });
+    } catch (error) {
+      failures.push({ path: pathTemplate, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  return {
+    ok: false,
+    path: failures[failures.length - 1]?.path || paths[0],
+    status: failures[failures.length - 1]?.status,
+    response: failures[failures.length - 1]?.response,
+    error: failures.map((failure) => `${failure.path}: ${failure.status || 'ERR'} ${failure.error || failure.response || ''}`).join(' | ')
+  };
 }
 
 async function createDashboardCompany() {
@@ -661,6 +833,7 @@ export async function emitDashboardEvent(params: {
   task: string;
   toAgent?: AgentId;
   artifact?: string;
+  forceRemote?: boolean;
 }): Promise<AgentEvent> {
   const dashboardAgentId = getDashboardAgentId(params.agentId);
   const dashboardToAgentId = params.toAgent ? getDashboardAgentId(params.toAgent) : null;
@@ -683,31 +856,59 @@ export async function emitDashboardEvent(params: {
     } as AgentEvent;
   }
 
+  if (dashboardRemoteEventsDisabledReason && !params.forceRemote) {
+    event.dashboardResponse = dashboardRemoteEventsDisabledReason;
+    return event;
+  }
+
   const companyId = getDashboardCompanyId();
-  if (!companyId) return event;
+  if (!companyId) {
+    if (isDashboardRequired() || params.forceRemote) {
+      event.dashboardError = 'Dashboard is enabled but no company id is configured.';
+    } else {
+      event.dashboardResponse = 'Dashboard is optional and no company id is configured; event kept local only.';
+    }
+    return event;
+  }
 
-  try {
-    const response = await fetch(`${dashboardBaseUrl()}/events`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        company_id: companyId,
-        agent_id: dashboardAgentId || params.agentId,
-        to_agent: dashboardToAgentId || params.toAgent,
-        event_type: params.eventType,
-        payload: {
-          task: params.task,
-          artifact: params.artifact,
-          agent_state: params.eventType.toLowerCase(),
-          logical_agent_id: params.agentId,
-          logical_to_agent: params.toAgent
-        }
-      })
-    });
+  const agentId = dashboardAgentId || params.agentId;
+  const toAgentId = dashboardToAgentId || params.toAgent || null;
+  const body = {
+    company_id: companyId,
+    agent_id: agentId,
+    to_agent: toAgentId || undefined,
+    to_agent_id: toAgentId || undefined,
+    event_type: params.eventType,
+    type: params.eventType,
+    task: params.task,
+    artifact: params.artifact,
+    payload: {
+      task: params.task,
+      artifact: params.artifact,
+      agent_state: params.eventType.toLowerCase(),
+      logical_agent_id: params.agentId,
+      logical_to_agent: params.toAgent
+    }
+  };
+  const configuredPath = process.env.DASHBOARD_EVENT_PATH?.trim();
+  const paths = configuredPath
+    ? [dashboardPath(configuredPath, { companyId, agentId, toAgentId })]
+    : [
+        '/events',
+        dashboardPath('/companies/{company_id}/events', { companyId, agentId, toAgentId }),
+        dashboardPath('/companies/{company_id}/agents/{agent_id}/events', { companyId, agentId, toAgentId })
+      ];
 
-    event.dashboardAccepted = response.ok;
-  } catch {
-    event.dashboardAccepted = false;
+  const result = await postDashboardEvent(paths, body);
+  event.dashboardAccepted = result.ok;
+  event.dashboardStatus = result.status;
+  event.dashboardPath = result.path;
+  event.dashboardResponse = result.response;
+  event.dashboardError = result.error;
+
+  if (!result.ok && dashboardEventFailureLogs < MAX_DASHBOARD_EVENT_FAILURE_LOGS) {
+    dashboardEventFailureLogs += 1;
+    console.warn(`[Dashboard] Event rejected for ${params.agentId}/${params.eventType}: ${result.error || `${result.status || 'ERR'} ${result.response || ''}`}`);
   }
 
   return event;

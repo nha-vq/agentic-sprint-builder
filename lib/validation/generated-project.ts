@@ -163,17 +163,64 @@ function hasUseClientDirective(content: string) {
   return /^\s*['"]use client['"]\s*;?/u.test(content);
 }
 
+function isLikelyAppRouterProject(output: DevOutput) {
+  return output.files.some((file) => {
+    const normalizedPath = normalizePath(file.path);
+    if (normalizedPath.endsWith('next.config.js') || normalizedPath.endsWith('next.config.mjs') || normalizedPath.endsWith('next.config.ts')) {
+      return true;
+    }
+
+    if (fileName(normalizedPath) !== 'package.json') return false;
+    return /["']next["']\s*:/iu.test(file.content);
+  });
+}
+
+function isAppRouterComponentPath(filePath: string) {
+  const normalizedPath = normalizePath(filePath);
+  return /(^|\/)app\/.*\.(tsx|jsx)$/iu.test(normalizedPath) || /(^|\/)components\/.*\.(tsx|jsx)$/iu.test(normalizedPath);
+}
+
+function findServerComponentClientOnlySignals(content: string) {
+  const signals: string[] = [];
+
+  if (/\bon[A-Z][A-Za-z0-9_$]*\s*=/u.test(content)) {
+    signals.push('JSX event handler prop such as onClick/onSubmit/onChange');
+  }
+
+  if (/\buse(State|Effect|Reducer|Ref|Memo|Callback|Context|LayoutEffect|Transition|DeferredValue|Optimistic)\s*\(/u.test(content)) {
+    signals.push('React client hook');
+  }
+
+  if (/from\s+['"]next\/navigation['"]/u.test(content) && /\b(useRouter|usePathname|useSearchParams|useSelectedLayoutSegment|useSelectedLayoutSegments)\b/u.test(content)) {
+    signals.push('client navigation hook from next/navigation');
+  }
+
+  if (/\b(window|document|localStorage|sessionStorage|navigator)\s*\./u.test(content)) {
+    signals.push('browser global access');
+  }
+
+  if (/from\s+['"]react-icons\//u.test(content)) {
+    signals.push('react-icons import');
+  }
+
+  return signals;
+}
+
 function findNextAppRuntimeIssues(output: DevOutput) {
   const issues: string[] = [];
+  if (!isLikelyAppRouterProject(output)) return issues;
+
   const sourceFiles = output.files.filter((file) => /\.(tsx|jsx)$/i.test(file.path));
 
   for (const file of sourceFiles) {
     const normalizedPath = normalizePath(file.path);
-    if (!/(^|\/)(app|components)\//u.test(normalizedPath)) continue;
+    if (!isAppRouterComponentPath(normalizedPath)) continue;
+    if (hasUseClientDirective(file.content)) continue;
 
-    if (/from\s+['"]react-icons\//u.test(file.content) && !hasUseClientDirective(file.content)) {
+    const signals = findServerComponentClientOnlySignals(file.content);
+    if (signals.length > 0) {
       issues.push(
-        `App Router component ${file.path} imports react-icons but is not marked with 'use client'; add the directive or replace the icons with server-safe markup to avoid prerender useContext failures.`
+        `App Router component ${file.path} uses ${signals.join(', ')} but is not marked with 'use client'; remove client-only code, render static controls without event handlers, or extract that behavior into a small Client Component.`
       );
     }
   }

@@ -31,7 +31,9 @@ README.md
 - Frontend communicates with backend via HTTP REST or GraphQL
 - Backend communicates with database via ORM or direct driver
 - All inter-service communication uses environment variables for configuration
-- Browser-facing API URLs must be browser-reachable (localhost), not internal Docker hostnames
+- Browser-facing API URLs must be browser-reachable (localhost/127.0.0.1), not internal Docker hostnames
+- Server-side frontend code running inside Docker must use internal Compose service URLs such as `http://backend:8000`, not `localhost`, when calling the backend container
+- Full-stack frontends with server rendering must document both public/browser API URLs and internal/server API URLs
 
 ### Port Conventions
 - Frontend: host port configurable (default 3001), container port configurable (default 3000)
@@ -50,6 +52,7 @@ README.md
 - Dockerfile for containerized deployment
 - Package manager config with dev, build, and start scripts
 - API base URL from environment variable
+- Separate public/browser API URL from server/internal API URL when SSR/server components call the backend from inside Docker
 - At least one navigable page demonstrating requirements
 
 ### Backend Requirements
@@ -110,6 +113,8 @@ README.md
 - [ ] Docker Compose builds all services
 - [ ] Health endpoint responds
 - [ ] Frontend can reach backend API
+- [ ] Server-rendered frontend routes can reach backend API from inside Docker
+- [ ] Frontend visible pages render data and images, not only HTTP 200
 - [ ] Backend can connect to database
 - [ ] All environment variables documented
 - [ ] README has complete setup instructions

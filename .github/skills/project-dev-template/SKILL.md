@@ -1,19 +1,20 @@
 ---
 agent_id: dev
-name: Project DEV Skill Template
-role: project-dev-template
+name: TA DEV Context Template
+role: project-dev-context-template
 temperature: 0.1
 ---
-# Project-Specific DEV Skill
+# TA DEV Context And Learning Memory
 
 ## Project Identity
 - Project ID: {{PROJECT_ID}}
 - Generated code workspace: generated-code
-- Skill file: project-skills/{{PROJECT_ID}}/dev.md
+- Static DEV skill: .github/skills/dev/SKILL.md
+- TA context file: project-skills/{{PROJECT_ID}}/ta-dev-context.md
 - Generated/updated at: {{UPDATED_AT}}
 
 ## Template Lineage
-This skill follows the existing SDLC workflow pattern used by the referenced project:
+This TA context follows the existing SDLC workflow pattern used by the referenced project:
 
 - Requirement Context
 - Technical Specification Context
@@ -22,7 +23,9 @@ This skill follows the existing SDLC workflow pattern used by the referenced pro
 - Implementation
 - Audit/Self-Check
 
-Use this project-specific skill for feature work, bug fixes, and repairs after the first generated-code scaffold exists. It supplements the overall DEV skill. The overall DEV skill still controls JSON output, safety, and generic runnable-project requirements.
+Use this project-specific context for feature work, bug fixes, and repairs after the first generated-code scaffold exists. It supplements the static DEV skill. The static DEV skill still controls JSON output, safety, generic runnable-project requirements, and file-generation behavior.
+
+Do not treat this file as a replacement for `.github/skills/dev/SKILL.md`. TA owns this file and updates it after generated-code changes, review feedback, deployment validation, and QA validation.
 
 ## Requirements Contract
 Treat the current user requirements and BA output as the acceptance contract. Preserve existing behavior that satisfies that contract. Do not remove pages, API routes, data models, seed/sample data, environment variables, scripts, or runtime wiring unless the new requirement explicitly changes them or a validation log proves that exact file is the defect.
@@ -35,6 +38,9 @@ Treat the current user requirements and BA output as the acceptance contract. Pr
 
 ### Frontend Visual Design Contract
 {{VISUAL_CONTRACT_EXCERPT}}
+
+### Stable UX/UI Contract
+{{UX_CONTRACT}}
 
 ## Prepared Tech Stack
 This section is produced by the prepare-tech-stack flow and is the source of truth for stack decisions unless later user requirements explicitly change it.
@@ -75,12 +81,23 @@ This section is produced by the prepare-tech-stack flow and is the source of tru
 
 ## Visual Fidelity Rules
 - Preserve the current frontend visual direction captured in the BA Frontend Visual Design Contract unless a later user request explicitly changes it.
+- Preserve the Stable UX/UI Contract above as the implementation source of truth for page hierarchy, layout, component inventory, tokens, image treatment, responsive behavior, and interaction rules.
 - For future frontend changes, map each visual requirement to concrete pages, components, styling/theme files, and seed media choices before generating files.
 - Visible mockup elements that are outside functional scope may be rendered as static or disabled UI only when they are needed to preserve the visual match; do not add unsupported backend workflows for them.
 - Do not regress the established header, navigation, footer, spacing, typography, color palette, product imagery treatment, responsive behavior, or component states when making focused feature or repair changes.
+- Mockup-driven apps must pass visible route checks, not only build and HTTP 200. Required list/detail pages must render seeded data, load images, and preserve the mockup's visible structure.
+
+## Runtime Integration Rules
+- Server-rendered frontend code inside Docker must use internal service URLs for backend calls; browser/client code must use public host URLs. Keep this split in generated env files, Compose, README, and API helpers.
+- If execution validation reports frontend data fetch errors, detail route 404, broken `/_next/image` URLs, or visual/mockup drift, record the exact failed contract and repair pattern here so future runs avoid repeating it.
 
 ## Database Conventions
 {{MIGRATIONS}}
+
+## TA Learning Memory
+These lessons are accumulated from previous Code Review, DevOps, static validation, execution validation, and QA failures. DEV must check this section before planning new files or repairs and avoid repeating these mistakes.
+
+{{TA_LEARNING_MEMORY}}
 
 ## Requirement-To-File Mapping Rules
 - For each future request, map every major requirement to existing or new files before generating changes.

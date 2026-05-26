@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDashboardIdentitySnapshot } from '@/lib/dashboard';
+import { getDashboardIdentitySnapshotWithConnectivity } from '@/lib/dashboard';
 import { ApiGuardError, assertRunStatusApiAccess } from '@/lib/security/api-guard';
 
 export const runtime = 'nodejs';
@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 export async function GET(request: NextRequest) {
   try {
     assertRunStatusApiAccess(request);
-    return NextResponse.json(getDashboardIdentitySnapshot());
+    return NextResponse.json(await getDashboardIdentitySnapshotWithConnectivity());
   } catch (error) {
     if (error instanceof ApiGuardError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });

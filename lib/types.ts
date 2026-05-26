@@ -1,6 +1,7 @@
 export type AgentId =
   | 'ba'
   | 'tech-stack'
+  | 'ux'
   | 'dev'
   | 'frontend-dev'
   | 'backend-dev'
@@ -32,6 +33,10 @@ export interface AgentEvent {
   dashboardAgentId?: string;
   dashboardToAgentId?: string;
   dashboardAccepted?: boolean;
+  dashboardStatus?: number;
+  dashboardPath?: string;
+  dashboardError?: string;
+  dashboardResponse?: string;
 }
 
 export interface RequirementImage {
@@ -52,6 +57,20 @@ export interface FreeImageCandidate {
   licenseUrl?: string;
   source: 'Wikimedia Commons';
   query: string;
+}
+
+export interface PreparedMediaAsset {
+  title: string;
+  path: string;
+  publicUrl: string;
+  sourceImageUrl: string;
+  sourcePageUrl: string;
+  downloadUrl: string;
+  license: string;
+  licenseUrl?: string;
+  query: string;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+  sizeBytes: number;
 }
 
 export interface RunRequest {
@@ -175,6 +194,19 @@ export interface PreparedTechStackOutput {
   tradeoffs: string[];
 }
 
+export interface UXContractOutput {
+  summary: string;
+  informationArchitecture: string;
+  layoutContract: string;
+  componentInventory: string[];
+  visualDesignTokens: string;
+  imageTreatment: string;
+  responsiveRules: string;
+  interactionRules: string;
+  consistencyRules: string[];
+  devHandoffChecklist: string[];
+}
+
 export type RepairScopeKind = 'initial' | 'docker' | 'frontend' | 'backend' | 'database' | 'tests' | 'docs' | 'config' | 'unknown';
 
 export interface RepairScope {
@@ -236,13 +268,39 @@ export interface GeneratedExecutionValidationResult {
   steps: GeneratedValidationStep[];
 }
 
+export type VisualComparisonStatus = 'PASS' | 'NEEDS_REVIEW' | 'NEEDS_FIX' | 'SKIPPED';
+
+export interface VisualComparisonImage {
+  label: string;
+  name: string;
+  assetPath: string;
+  sourcePath?: string;
+  width?: number;
+  height?: number;
+  aspectRatio?: number;
+}
+
+export interface VisualComparisonResult {
+  status: VisualComparisonStatus;
+  score: number;
+  reportPath: string;
+  reportUrl: string;
+  mockups: VisualComparisonImage[];
+  screenshots: VisualComparisonImage[];
+  findings: string[];
+  recommendations: string[];
+}
+
 export interface RunResult {
   runId: string;
   createdAt: string;
   topic: string;
   projectId?: string;
+  projectDevContextPath?: string;
+  /** @deprecated Use projectDevContextPath. Kept for older saved run compatibility. */
   projectDevSkillPath?: string;
   preparedTechStack?: PreparedTechStackOutput;
+  uxContract?: UXContractOutput;
   baOutput: string;
   devOutput: DevOutput;
   codeReviewStatus?: 'PASS' | 'NEEDS_FIX';
@@ -260,9 +318,16 @@ export interface RunResult {
   executionValidation?: GeneratedExecutionValidationResult;
   runtime?: GeneratedRuntimeResult;
   freeImageCandidates?: FreeImageCandidate[];
+  preparedMediaAssets?: PreparedMediaAsset[];
   agentModels?: AgentModelMap;
   llmUsage?: LlmUsageRecord[];
   costSummary?: RunCostSummary;
+  costBudgetUsd?: number;
+  costBudgetExceeded?: boolean;
+  costControlNotes?: string[];
+  observationReportPath?: string;
+  observationReportUrl?: string;
+  visualComparison?: VisualComparisonResult;
   events: AgentEvent[];
   outputDir: string;
   codeOutputDir: string;

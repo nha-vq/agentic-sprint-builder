@@ -40,6 +40,19 @@ interface OpenRouterRequestBody {
   };
 }
 
+export interface OpenRouterRetryOptions {
+  maxRetries?: number;
+  retryDelayMs?: number;
+  retryBackoffMultiplier?: number;
+}
+
+export class OpenRouterEmptyContentError extends Error {
+  constructor(message = 'OpenRouter response did not include content') {
+    super(message);
+    this.name = 'OpenRouterEmptyContentError';
+  }
+}
+
 interface OpenRouterResponse {
   id?: string;
   choices?: Array<{
@@ -83,7 +96,48 @@ function readPositiveIntEnv(name: string, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
+function readPositiveFloatEnv(name: string, fallback: number) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Run canceled by user.'));
+      return;
+    }
+
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timeout);
+        reject(new Error('Run canceled by user.'));
+      },
+      { once: true }
+    );
+  });
+}
+
+function isRetryableOpenRouterError(error: unknown) {
+  if (error instanceof OpenRouterEmptyContentError) return true;
+  if (!(error instanceof Error)) return false;
+  return /OpenRouter error (408|409|425|429|5\d\d)|fetch failed|ECONNRESET|ETIMEDOUT|timeout|network|temporar|rate limit/i.test(error.message);
+}
+
+export function getOpenRouterRetryOptions(overrides?: OpenRouterRetryOptions) {
+  return {
+    maxRetries: overrides?.maxRetries ?? readPositiveIntEnv('LLM_MAX_RETRIES', 2),
+    retryDelayMs: overrides?.retryDelayMs ?? readPositiveIntEnv('LLM_RETRY_DELAY_MS', 1500),
+    retryBackoffMultiplier: overrides?.retryBackoffMultiplier ?? readPositiveFloatEnv('LLM_RETRY_BACKOFF_MULTIPLIER', 2)
+  };
+}
+
+async function callOpenRouterOnce(input: OpenRouterInput): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY?.trim();
   if (!apiKey || /^(your_openrouter_api_key|placeholder|changeme)$/i.test(apiKey)) {
     throw new Error('Missing OPENROUTER_API_KEY. Add it to .env.local.');
@@ -187,5 +241,24 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
     if (text) return text;
   }
 
-  throw new Error('OpenRouter response did not include content');
+  throw new OpenRouterEmptyContentError();
+}
+
+export async function callOpenRouter(input: OpenRouterInput & { retry?: OpenRouterRetryOptions }): Promise<string> {
+  const retry = getOpenRouterRetryOptions(input.retry);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= retry.maxRetries; attempt += 1) {
+    try {
+      return await callOpenRouterOnce(input);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableOpenRouterError(error) || attempt >= retry.maxRetries) break;
+
+      const delay = Math.round(retry.retryDelayMs * Math.pow(retry.retryBackoffMultiplier, attempt));
+      await sleep(delay, input.signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }

@@ -27,7 +27,19 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
               <p className="mt-1 text-sm text-slate-500">QA fix iterations: {result.qaFixIterations ?? 0}</p>
               <p className="mt-1 text-sm text-slate-500">Execution validation fixes: {result.executionValidationFixIterations ?? 0}</p>
               <p className="mt-1 text-sm font-semibold text-slate-700">AI cost: {result.costSummary ? formatUsd(result.costSummary.totalUsd) : '$0.0000'}</p>
+              {result.visualComparison ? (
+                <p className="mt-1 text-sm font-semibold text-slate-700">
+                  Visual comparison: {result.visualComparison.score}/100 ({result.visualComparison.status})
+                </p>
+              ) : null}
+              {result.costBudgetUsd ? (
+                <p className={`mt-1 text-sm font-semibold ${result.costBudgetExceeded ? 'text-amber-700' : 'text-slate-500'}`}>
+                  Cost budget: {formatUsd(result.costBudgetUsd)}{result.costBudgetExceeded ? ' reached' : ''}
+                </p>
+              ) : null}
               <p className="mt-1 text-sm text-slate-500">Free image candidates: {result.freeImageCandidates?.length ?? 0}</p>
+              <p className="mt-1 text-sm text-slate-500">Prepared media assets: {result.preparedMediaAssets?.length ?? 0}</p>
+              <p className="mt-1 text-sm text-slate-500">TA DEV context: {result.projectDevContextPath || result.projectDevSkillPath || 'Not recorded'}</p>
               <p className="mt-2 text-sm text-slate-500">Artifacts: {result.outputDir}</p>
               <p className="mt-1 text-sm text-slate-500">Generated code: {result.codeOutputDir}</p>
               <ExecutionValidationStatus result={result} />
@@ -45,26 +57,39 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
               <Link href="/" className="rounded-2xl bg-slate-900 px-5 py-3 font-semibold text-white hover:bg-slate-800">
                 New Run
               </Link>
+              {result.observationReportUrl && (
+                <a href={result.observationReportUrl} target="_blank" rel="noreferrer" className="rounded-2xl border border-blue-200 px-5 py-3 font-semibold text-blue-700 hover:bg-blue-50">
+                  Observation Report
+                </a>
+              )}
             </div>
           </div>
         </section>
 
         <section className="rounded-3xl bg-white p-6 shadow-sm">
           <h2 className="text-2xl font-bold">Timeline</h2>
+          <DashboardEventSummary result={result} />
           <div className="mt-4 grid gap-3 md:grid-cols-3">
             {result.events.map((event, index) => (
               <div key={`${event.timestamp}-${index}`} className="rounded-2xl border border-slate-200 p-4">
                 <p className="text-sm font-bold uppercase text-blue-600">{event.agentId} · {event.eventType}</p>
                 <p className="mt-2 text-sm text-slate-700">{event.task}</p>
-                <p className="mt-2 text-xs text-slate-400">Dashboard: {event.dashboardAccepted ? 'accepted' : 'local only'}</p>
+                <p className="mt-2 text-xs text-slate-400">
+                  Dashboard: {event.dashboardAccepted ? 'accepted' : event.dashboardError ? 'rejected' : 'local only'}
+                  {event.dashboardStatus ? ` (${event.dashboardStatus})` : ''}
+                </p>
+                {event.dashboardError ? <p className="mt-1 break-words text-xs text-red-500">{event.dashboardError}</p> : null}
               </div>
             ))}
           </div>
         </section>
 
         <Artifact title="BA Artifacts" content={result.baOutput} />
+        {result.uxContract ? <Artifact title="UX Contract" content={JSON.stringify(result.uxContract, null, 2)} /> : null}
         {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
         {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
+        {result.costControlNotes?.length ? <Artifact title="Cost Controls" content={result.costControlNotes.map((note) => `- ${note}`).join('\n')} /> : null}
+        {result.visualComparison ? <Artifact title="Visual Comparison" content={formatVisualComparison(result.visualComparison)} /> : null}
         <Artifact title="Architecture" content={result.devOutput.architecture} />
         <Artifact
           title="Generated Files"
@@ -75,9 +100,33 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
           <Artifact title="Execution Validation" content={JSON.stringify(result.executionValidation, null, 2)} />
         )}
         {result.freeImageCandidates?.length ? <Artifact title="Free Image Candidates" content={formatFreeImageCandidates(result.freeImageCandidates)} /> : null}
+        {result.preparedMediaAssets?.length ? <Artifact title="Prepared Media Assets" content={formatPreparedMediaAssets(result.preparedMediaAssets)} /> : null}
         <Artifact title="QA Report" content={result.qaOutput} />
       </div>
     </main>
+  );
+}
+
+function DashboardEventSummary({ result }: { result: NonNullable<Awaited<ReturnType<typeof readRunResult>>> }) {
+  if (!result.events.length) return null;
+  const accepted = result.events.filter((event) => event.dashboardAccepted).length;
+  const rejected = result.events.filter((event) => !event.dashboardAccepted && event.dashboardError).length;
+  const localOnly = result.events.length - accepted - rejected;
+  const firstRejected = result.events.find((event) => !event.dashboardAccepted && event.dashboardError);
+
+  return (
+    <div className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${rejected ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>
+      <p className="font-semibold">
+        Dashboard events: {accepted} accepted, {rejected} rejected, {localOnly} local only
+      </p>
+      {firstRejected ? (
+        <p className="mt-1 break-words text-xs">
+          First rejection: {firstRejected.agentId}/{firstRejected.eventType}
+          {firstRejected.dashboardPath ? ` via ${firstRejected.dashboardPath}` : ''}
+          {firstRejected.dashboardStatus ? ` (${firstRejected.dashboardStatus})` : ''}: {firstRejected.dashboardError}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -111,6 +160,24 @@ function formatFreeImageCandidates(candidates: NonNullable<NonNullable<Awaited<R
     .join('\n');
 }
 
+function formatPreparedMediaAssets(assets: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['preparedMediaAssets']>) {
+  return assets
+    .map(
+      (asset, index) => `### ${index + 1}. ${asset.title}
+
+- Public URL: ${asset.publicUrl}
+- Generated path: ${asset.path}
+- Source image: ${asset.sourceImageUrl}
+- Source page: ${asset.sourcePageUrl}
+- Download URL: ${asset.downloadUrl}
+- License: ${asset.license}${asset.licenseUrl ? `\n- License URL: ${asset.licenseUrl}` : ''}
+- Query: ${asset.query}
+- Type/size: ${asset.mimeType}, ${Math.round(asset.sizeBytes / 1024)} KB
+`
+    )
+    .join('\n');
+}
+
 function formatAgentModels(models: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['agentModels']>) {
   return Object.entries(models)
     .map(([agentId, model]) => `- ${agentId}: ${model}`)
@@ -128,6 +195,25 @@ function formatCostSummary(summary: NonNullable<NonNullable<Awaited<ReturnType<t
     '',
     '## By Model',
     ...summary.byModel.map((item) => `- ${item.id}: ${formatUsd(item.costUsd)} (${item.calls} calls, ${item.totalTokens} tokens)`)
+  ].join('\n');
+}
+
+function formatVisualComparison(comparison: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['visualComparison']>) {
+  return [
+    `Status: ${comparison.status}`,
+    `Score: ${comparison.score}/100`,
+    `Report: ${comparison.reportPath}`,
+    `URL: ${comparison.reportUrl}`,
+    '',
+    '## Findings',
+    ...(comparison.findings.length ? comparison.findings.map((finding) => `- ${finding}`) : ['- none']),
+    '',
+    '## Recommendations',
+    ...(comparison.recommendations.length ? comparison.recommendations.map((item) => `- ${item}`) : ['- none']),
+    '',
+    '## Evidence',
+    `- Mockups: ${comparison.mockups.length}`,
+    `- Screenshots: ${comparison.screenshots.length}`
   ].join('\n');
 }
 

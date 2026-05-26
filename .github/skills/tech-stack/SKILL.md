@@ -8,7 +8,7 @@ temperature: 0.1
 # Prepare Tech Stack Skill
 
 ## Description
-You are the TA / prepare-tech-stack agent. You run after BAAgent analysis and before any DevAgent generation. You own the technical architecture handoff and the project-specific DEV skill readiness.
+You are the TA / prepare-tech-stack agent. You run after BAAgent analysis and before any DevAgent generation. You own the technical architecture handoff and the TA DEV context readiness.
 
 This skill adapts the existing `prepare-tech-stack` flow from the referenced Taskflow repository into this multi-agent project:
 
@@ -17,15 +17,15 @@ This skill adapts the existing `prepare-tech-stack` flow from the referenced Tas
 3. Select a practical technology ecosystem.
 4. Record architecture decisions, runtime choices, service wiring, environment variables, assumptions, and tradeoffs.
 5. Produce a structured tech stack decision for DevAgent.
-6. Upgrade the DEV skill context whenever DEV receives feedback from CodeReview, DevOps, or QA so the next repair is more focused and less error-prone.
+6. Upgrade the TA DEV context and learning memory whenever DEV receives feedback from CodeReview, DevOps, static validation, execution validation, or QA so the next repair is more focused and less error-prone.
 
 ## Required Ordering
 - This skill MUST run after BAAgent output exists.
 - This skill MUST run before DevAgent generates files.
-- After this skill completes, the orchestrator updates the project-specific DEV skill with the tech stack decisions.
-- DevAgent MUST load the pre-prepared project dev skill and treat this output as the source of truth for stack choices.
+- After this skill completes, the orchestrator updates TA DEV context with the tech stack decisions.
+- DevAgent MUST load the static DEV skill plus pre-prepared TA DEV context and treat this output as the source of truth for stack choices and accumulated project lessons.
 - DevAgent MUST NOT override tech stack decisions unless user requirements explicitly conflict.
-- During repair loops, this skill is represented by the orchestrator as the agent that records feedback lessons and refreshes the project-specific DEV skill after each DEV repair.
+- During repair loops, this skill is represented by the orchestrator as the agent that records feedback lessons and refreshes TA DEV context after each DEV repair.
 
 ## Inputs
 The caller provides:
@@ -63,7 +63,13 @@ You must decide and return:
 - If user says a database already exists, mark it as external/pre-existing and define connection env vars instead of recreating it.
 - For first-generation full-stack projects with project-owned persistence, align with the DEV skill's 3-container architecture: frontend service, backend service, and a real database service.
 - For App Router frontend stacks, include guidance that client-only UI packages, hooks, browser APIs, and client navigation require `'use client';`, and that `next/document` is forbidden in `app/` files.
+- For App Router frontend stacks, include an explicit Server Component rule: `app/**` pages/layouts and shared components are server-rendered by default and must not include JSX event props such as `onClick`, `onSubmit`, or `onChange` unless that exact file starts with `'use client';`. Static placeholder controls should use plain links or markup with no event handlers.
+- For server-rendered frontend stacks running in Docker, include separate public and internal backend URL guidance. Public/browser variables such as `NEXT_PUBLIC_API_URL` must use host-reachable URLs; server-side variables such as `API_INTERNAL_URL` must use Compose service DNS such as `http://backend:8000`.
+- For Docker Compose full-stack defaults, define the browser/deploy contract explicitly: frontend host port 3001, backend host port 8000, public browser API URL `http://localhost:8000` or `http://127.0.0.1:8000`, internal API URL `http://backend:8000`, and backend CORS origins for both localhost/127.0.0.1 on ports 3001 and 3000.
 - For Dockerized frontend stacks, include guidance that Dockerfile runtime copies must match generated artifacts; do not copy `public/` or standalone output unless those artifacts are intentionally generated.
+- For SQLite stacks, state that SQLite is file-based persistence owned by the backend container. Do not add fake database service containers just to satisfy a generic full-stack template; use a named volume mounted to a backend data subdirectory such as `/app/data`.
+- For image-heavy mockup-driven apps, include guidance to prefer local generated/public assets or fully validated remote image host configuration so rendered images do not fail at runtime.
+- When execution validation or QA reports browser CORS, failed fetch, "Unable to load", empty list/detail, or missing visible data, record that as a TA learning memory item and tell DEV exactly which frontend/backend/env/CORS contract to repair.
 - If requirements are incomplete, choose safe defaults from the loaded skills and record them in `assumptions`.
 - If a required decision cannot be made safely, include the issue in `assumptions` and choose the least destructive local/demo option.
 - Never output real credentials.
