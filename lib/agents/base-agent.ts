@@ -16,6 +16,11 @@ export async function runMarkdownSkillAgent(params: {
     name: string;
     schema: Record<string, unknown>;
   };
+  retry?: {
+    maxRetries?: number;
+    retryDelayMs?: number;
+    retryBackoffMultiplier?: number;
+  };
 }) {
   const skill = await loadSkill(params.agentId);
   const system = params.systemAppend?.trim() ? `${skill.body}\n\n${params.systemAppend.trim()}` : skill.body;
@@ -29,6 +34,7 @@ export async function runMarkdownSkillAgent(params: {
     temperature: skill.meta.temperature ?? params.fallbackTemperature ?? 0.2,
     maxTokens: params.maxTokens,
     signal: params.signal,
-    jsonSchema: params.jsonSchema
+    jsonSchema: params.jsonSchema,
+    retry: params.retry
   });
 }

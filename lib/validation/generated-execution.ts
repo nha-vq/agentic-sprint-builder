@@ -1,15 +1,20 @@
 import { spawn } from 'child_process';
 import fs from 'fs/promises';
+import net from 'net';
+import os from 'os';
 import path from 'path';
 import { readGeneratedCodeSnapshot } from '@/lib/storage/file-writer';
 import { inferExecutionRepairScope } from './repair-scope';
-import type { GeneratedExecutionValidationResult, GeneratedValidationStep, RunProgressReporter } from '@/lib/types';
+import type { GeneratedExecutionValidationResult, GeneratedValidationStep, PreparedMediaAsset, RunProgressReporter } from '@/lib/types';
 
 const COMMAND_TIMEOUT_MS = 180_000;
 const HEALTH_TIMEOUT_MS = 45_000;
 const LOG_TAIL_CHARS = 8_000;
 const COMPOSE_PROJECT_NAME = 'agentic-sprint-builder-generated';
 const COMMAND_HEARTBEAT_MS = 15_000;
+const DEFAULT_GENERATED_FRONTEND_HOST_PORT = 55_001;
+const DEFAULT_GENERATED_BACKEND_HOST_PORT = 55_080;
+const DEFAULT_GENERATED_DATABASE_HOST_PORT = 55_432;
 
 interface CommandResult {
   ok: boolean;
@@ -24,10 +29,14 @@ interface ComposeEngine {
   readinessArgs: string[];
 }
 
+type ImageFileFormat = 'gif' | 'jpeg' | 'png' | 'svg' | 'webp' | 'unknown';
+
 const COMPOSE_ENGINES: ComposeEngine[] = [
   { name: 'docker compose', command: 'docker', baseArgs: ['compose'], readinessArgs: ['info'] },
   { name: 'nerdctl compose', command: 'nerdctl', baseArgs: ['compose'], readinessArgs: ['info'] }
 ];
+
+const IMAGE_ASSET_EXTENSIONS = new Set(['.gif', '.jpeg', '.jpg', '.png', '.svg', '.webp']);
 
 function getGeneratedCodeDir() {
   return path.resolve(process.cwd(), 'generated-code');
@@ -46,11 +55,11 @@ function getPythonCommand() {
 }
 
 function getBackendPort() {
-  return Number(process.env.GENERATED_BACKEND_PORT || 8000);
+  return Number(process.env.GENERATED_BACKEND_PORT || DEFAULT_GENERATED_BACKEND_HOST_PORT);
 }
 
 function getFrontendPort() {
-  return Number(process.env.GENERATED_FRONTEND_PORT || 3001);
+  return Number(process.env.GENERATED_FRONTEND_PORT || DEFAULT_GENERATED_FRONTEND_HOST_PORT);
 }
 
 function shouldValidateExecution() {
@@ -73,8 +82,26 @@ function shouldRemoveGeneratedComposeImages() {
   return process.env.REMOVE_GENERATED_COMPOSE_IMAGES === 'true';
 }
 
+function shouldRemoveGeneratedComposeVolumes() {
+  return process.env.REMOVE_GENERATED_COMPOSE_VOLUMES !== 'false';
+}
+
 function shouldRunGeneratedTests() {
   return process.env.RUN_GENERATED_TESTS === 'true';
+}
+
+function shouldRunBrowserValidation() {
+  return process.env.VALIDATE_GENERATED_BROWSER !== 'false';
+}
+
+function getBrowserValidationVirtualTimeBudgetMs() {
+  const parsed = Number.parseInt(process.env.GENERATED_BROWSER_VIRTUAL_TIME_BUDGET_MS || '8000', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8_000;
+}
+
+function getBrowserValidationAttempts() {
+  const parsed = Number.parseInt(process.env.GENERATED_BROWSER_VALIDATION_ATTEMPTS || '2', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 2;
 }
 
 function shouldAutoStartRancherDesktop() {
@@ -99,7 +126,7 @@ function getRancherStartContainerEngine() {
 
 function getRancherStartKubernetesFlag() {
   const raw = process.env.RANCHER_START_KUBERNETES?.trim().toLowerCase();
-  if (!raw) return ['--kubernetes.enabled=false'];
+  if (!raw) return [];
   if (['true', '1', 'yes', 'on'].includes(raw)) return ['--kubernetes.enabled=true'];
   if (['false', '0', 'no', 'off'].includes(raw)) return ['--kubernetes.enabled=false'];
   return [];
@@ -129,8 +156,66 @@ function truncate(value: string, maxChars = LOG_TAIL_CHARS) {
   return value.slice(value.length - maxChars);
 }
 
+function truncateHead(value: string, maxChars: number) {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} trailing chars]`;
+}
+
+function extractDiagnosticHighlights(output: string, maxChars = 2_400) {
+  const lines = output.split(/\r?\n/u);
+  const highSignalPatterns = [
+    /Ambiguous mapping|Cannot map .* method|There is already .* mapped/i,
+    /Application run failed|Error starting ApplicationContext|BeanCreationException|IllegalStateException/i,
+    /Failed to compile|Treating warnings as errors|Module not found|Cannot find module|npm ERR/i,
+    /Traceback|ModuleNotFoundError|ImportError|SyntaxError|ReferenceError|TypeError/i,
+    /\b(ERROR|FATAL)\b/i
+  ];
+
+  const selected: string[] = [];
+  const seen = new Set<number>();
+  for (const pattern of highSignalPatterns) {
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!pattern.test(lines[index])) continue;
+
+      const start = Math.max(0, index - 1);
+      const end = Math.min(lines.length - 1, index + 3);
+      for (let contextIndex = start; contextIndex <= end; contextIndex += 1) {
+        if (seen.has(contextIndex)) continue;
+        seen.add(contextIndex);
+        selected.push(lines[contextIndex]);
+      }
+    }
+  }
+
+  return selected.length > 0 ? truncateHead(selected.join('\n'), maxChars) : '';
+}
+
+function composeDiagnosticsMessage(engineName: string, phase: string, output: string) {
+  const highlights = extractDiagnosticHighlights(output);
+  if (!highlights) {
+    return `Captured ${engineName} logs and container health diagnostics after ${phase}.\n${truncate(output, 2400)}`;
+  }
+
+  return [
+    `Captured ${engineName} logs and container health diagnostics after ${phase}.`,
+    'Key failure lines:',
+    highlights,
+    '',
+    'Diagnostics tail:',
+    truncate(output, 1400)
+  ].join('\n');
+}
+
 function isHostComposeInfrastructureFailure(message: string) {
+  if (isGeneratedCodeFailureSignal(message)) return false;
+
   return /failed to connect to the backend|timed out dialing hyper-v socket|cannot connect to the docker daemon|docker daemon is not running|error during connect|open \/\/\.\/pipe\/docker_engine|containerd socket|rancher desktop.*(?:not ready|unavailable)|docker compose engine is unavailable|local compose engine is unavailable|must be run with elevated privileges|wsl.*docker/i.test(
+    message
+  );
+}
+
+function isGeneratedCodeFailureSignal(message: string) {
+  return /failed to compile|type error|typescript|tsc|next build|npm run build|module not found|can't resolve|copy failed|failed to calculate checksum|dockerfile|process .* did not complete successfully|frontend\/|backend\/|app\/|components\/|\.tsx?\b|\.jsx?\b|\.py\b|_next\/image|url parameter is not allowed/i.test(
     message
   );
 }
@@ -150,6 +235,56 @@ async function firstExistingPath(paths: string[]) {
   }
 
   return null;
+}
+
+function imageFormatFromExtension(filePath: string): Exclude<ImageFileFormat, 'unknown'> | null {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === '.jpg' || extension === '.jpeg') return 'jpeg';
+  if (extension === '.png') return 'png';
+  if (extension === '.webp') return 'webp';
+  if (extension === '.gif') return 'gif';
+  if (extension === '.svg') return 'svg';
+  return null;
+}
+
+function imageFormatFromContentType(contentType: string | null): ImageFileFormat {
+  const normalized = contentType?.split(';')[0]?.trim().toLowerCase() || '';
+  if (normalized === 'image/jpeg') return 'jpeg';
+  if (normalized === 'image/png') return 'png';
+  if (normalized === 'image/webp') return 'webp';
+  if (normalized === 'image/gif') return 'gif';
+  if (normalized === 'image/svg+xml') return 'svg';
+  return 'unknown';
+}
+
+function sniffImageFormat(buffer: Buffer): ImageFileFormat {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'png';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  if (buffer.length >= 6 && /^GIF8[79]a$/u.test(buffer.subarray(0, 6).toString('ascii'))) return 'gif';
+
+  const textStart = buffer.subarray(0, Math.min(buffer.length, 512)).toString('utf-8').trimStart();
+  if (/^(?:<\?xml[^>]*>\s*)?(?:<!doctype\s+svg[^>]*>\s*)?<svg[\s>]/iu.test(textStart)) return 'svg';
+
+  return 'unknown';
+}
+
+function imageFormatLabel(format: ImageFileFormat) {
+  if (format === 'unknown') return 'unknown/non-image bytes';
+  return format.toUpperCase();
+}
+
+function imageSignatureMismatchMessage(filePath: string, actual: ImageFileFormat) {
+  const expected = imageFormatFromExtension(filePath);
+  const relative = filePath.replace(/\\/g, '/');
+  if (!expected) return null;
+  if (actual === expected) return null;
+
+  if (actual === 'svg' && expected !== 'svg') {
+    return `${relative} has a ${path.extname(filePath)} extension but contains SVG text. Browsers will request it as ${expected.toUpperCase()} and fail to decode it; rename it to .svg and update references, or provide real ${expected.toUpperCase()} image bytes.`;
+  }
+
+  return `${relative} has a ${path.extname(filePath)} extension but its file signature is ${imageFormatLabel(actual)}; provide valid ${expected.toUpperCase()} bytes or change the extension and all references to match the actual format.`;
 }
 
 async function getRancherDesktopLaunchCommand() {
@@ -245,6 +380,47 @@ export async function prewarmGeneratedComposeRuntime(onProgress?: RunProgressRep
   });
 
   await launchDetached(launchCommand.command, launchCommand.args);
+
+  const timeoutMs = getRancherStartTimeoutMs();
+  const pollMs = getRancherPollMs();
+  const startedAt = Date.now();
+  let lastProbe = probe;
+  let lastProgressAt = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) throw new Error('Run canceled by user.');
+    await abortableDelay(pollMs, signal);
+
+    lastProbe = await probeAnyComposeEngineReady(getComposeEnginesToTry(), process.cwd(), signal);
+    if (lastProbe.ok) {
+      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+      await onProgress?.({
+        stepId: 'execution-validation',
+        stepStatus: 'PENDING',
+        level: 'success',
+        message: `Rancher/Docker became ready during prewarm after ${elapsedSeconds}s: ${lastProbe.message}`
+      });
+      return;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs - lastProgressAt >= COMMAND_HEARTBEAT_MS) {
+      lastProgressAt = elapsedMs;
+      await onProgress?.({
+        stepId: 'execution-validation',
+        stepStatus: 'PENDING',
+        level: 'info',
+        message: `Waiting for Rancher/Docker during prewarm after ${Math.round(elapsedMs / 1000)}s.\n${lastOutputLines(lastProbe.message, 4)}`
+      });
+    }
+  }
+
+  await onProgress?.({
+    stepId: 'execution-validation',
+    stepStatus: 'PENDING',
+    level: 'warn',
+    message: `Rancher/Docker prewarm timed out after ${timeoutMs}ms. Execution validation will check again later.\n${lastProbe.message}`
+  });
 }
 
 function shouldSkipWorkspaceEntry(entryName: string) {
@@ -310,6 +486,80 @@ async function findFilesByName(dir: string, names: string[], ignored = new Set([
   return matches;
 }
 
+async function findImageAssetFiles(dir: string, ignored = new Set(['node_modules', '.next', '.git', '.venv', '.runtime-logs', '.validation-logs', '__pycache__', '.pytest_cache'])): Promise<string[]> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const matches: string[] = [];
+  for (const entry of entries) {
+    if (ignored.has(entry.name)) continue;
+
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      matches.push(...(await findImageAssetFiles(fullPath, ignored)));
+    } else if (entry.isFile() && IMAGE_ASSET_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      matches.push(fullPath);
+    }
+  }
+
+  return matches;
+}
+
+async function generatedProjectTextSearchBlob(dir: string): Promise<string> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return '';
+  }
+
+  const chunks: string[] = [];
+  for (const entry of entries) {
+    if (shouldSkipWorkspaceEntry(entry.name)) continue;
+
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      chunks.push(await generatedProjectTextSearchBlob(entryPath));
+      continue;
+    }
+
+    if (!entry.isFile() || !shouldScanGeneratedTextFile(entryPath)) continue;
+    try {
+      const stat = await fs.stat(entryPath);
+      if (stat.size > 1_000_000) continue;
+      chunks.push((await fs.readFile(entryPath, 'utf-8')).toLowerCase());
+    } catch {
+      // Ignore unreadable generated files; runtime validation will catch concrete failures.
+    }
+  }
+
+  return chunks.join('\n');
+}
+
+function imageAssetIsReferenced(codeDir: string, filePath: string, sourceText: string) {
+  const relativePath = path.relative(codeDir, filePath).replace(/\\/g, '/').toLowerCase();
+  const publicIndex = relativePath.indexOf('/public/');
+  const springStaticIndex = relativePath.indexOf('/src/main/resources/static/');
+  const publicRelative = publicIndex >= 0 ? relativePath.slice(publicIndex + '/public/'.length) : relativePath;
+  const springStaticRelative =
+    springStaticIndex >= 0 ? relativePath.slice(springStaticIndex + '/src/main/resources/static/'.length) : '';
+  const aliases = [
+    relativePath,
+    publicRelative,
+    `/${publicRelative}`,
+    publicRelative.replace(/^assets\//u, '/assets/'),
+    publicRelative.replace(/^images\//u, '/images/'),
+    springStaticRelative,
+    springStaticRelative ? `/${springStaticRelative}` : ''
+  ];
+
+  return aliases.some((alias) => alias && sourceText.includes(alias));
+}
+
 async function findNearestManifestDir(codeDir: string, names: string[], contentPattern?: RegExp) {
   const manifests = await findFilesByName(codeDir, names.map((name) => name.toLowerCase()));
   for (const manifest of manifests) {
@@ -360,7 +610,8 @@ function runCommand(
   cwd: string,
   timeout = COMMAND_TIMEOUT_MS,
   onHeartbeat?: (output: string, elapsedMs: number) => void | Promise<void>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxOutputChars = LOG_TAIL_CHARS * 4
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     let settled = false;
@@ -383,8 +634,8 @@ function runCommand(
 
     const appendOutput = (chunk: Buffer) => {
       output += chunk.toString();
-      if (output.length > LOG_TAIL_CHARS * 4) {
-        output = output.slice(output.length - LOG_TAIL_CHARS * 4);
+      if (output.length > maxOutputChars) {
+        output = output.slice(output.length - maxOutputChars);
       }
     };
 
@@ -673,6 +924,59 @@ async function copyEnvExampleIfSafe(codeDir: string): Promise<GeneratedValidatio
   };
 }
 
+async function validateStaticImageAssetIntegrity(codeDir: string, logDir: string): Promise<GeneratedValidationStep> {
+  const imageFiles = await findImageAssetFiles(codeDir);
+  if (imageFiles.length === 0) {
+    return skippedStep('static image asset integrity', 'No generated static image assets were found.');
+  }
+
+  const sourceText = await generatedProjectTextSearchBlob(codeDir);
+  const referencedImageFiles = imageFiles.filter((filePath) => imageAssetIsReferenced(codeDir, filePath, sourceText));
+  if (referencedImageFiles.length === 0) {
+    return skippedStep('static image asset integrity', `Found ${imageFiles.length} generated image asset(s), but none were referenced by generated source files.`);
+  }
+
+  const findings: string[] = [];
+  for (const filePath of referencedImageFiles) {
+    const relativePath = path.relative(codeDir, filePath).replace(/\\/g, '/');
+    const buffer = await fs.readFile(filePath);
+    const actual = sniffImageFormat(buffer);
+    const finding = imageSignatureMismatchMessage(relativePath, actual);
+    if (finding) findings.push(finding);
+  }
+
+  if (findings.length === 0) {
+    return {
+      name: 'static image asset integrity',
+      status: 'PASS',
+      command: `scan ${referencedImageFiles.length} referenced generated image asset(s)`,
+      message: `All ${referencedImageFiles.length} referenced generated image asset(s) have content signatures that match their extensions.`
+    };
+  }
+
+  const logFile = await writeLog(
+    logDir,
+    'static-image-asset-integrity',
+    [
+      'Generated static image assets with invalid signatures:',
+      ...findings.map((finding) => `- ${finding}`),
+      '',
+      'Repair guidance:',
+      '- Do not write SVG/XML text into .jpg, .jpeg, .png, .webp, or .gif files.',
+      '- Either rename SVG assets to .svg and update every frontend/backend seed reference, or provide real raster image bytes through prepared media assets.',
+      '- Plain <img> and CSS background URLs must point to files the browser can decode.'
+    ].join('\n')
+  );
+
+  return {
+    name: 'static image asset integrity',
+    status: 'FAIL',
+    command: `scan ${referencedImageFiles.length} referenced generated image asset(s)`,
+    logFile,
+    message: `Generated static image assets have invalid file signatures:\n${findings.map((finding) => `- ${finding}`).join('\n')}`
+  };
+}
+
 async function waitForHttp(name: string, urls: string[], timeoutMs = HEALTH_TIMEOUT_MS, onProgress?: RunProgressReporter, signal?: AbortSignal): Promise<GeneratedValidationStep> {
   const startedAt = Date.now();
   let lastMessage = '';
@@ -718,6 +1022,1249 @@ async function waitForHttp(name: string, urls: string[], timeoutMs = HEALTH_TIME
     command: urls.map((url) => `GET ${url}`).join(' || '),
     message: lastMessage || `Health check did not pass within ${timeoutMs}ms.`
   };
+}
+
+function frontendBaseUrls() {
+  return [`http://127.0.0.1:${getFrontendPort()}/`, `http://localhost:${getFrontendPort()}/`];
+}
+
+const PREPARED_MEDIA_MANIFEST_RELATIVE_PATH = path.join('frontend', 'public', 'assets', 'generated-media', 'media-manifest.json');
+
+function backendBaseUrls() {
+  return [`http://127.0.0.1:${getBackendPort()}/`, `http://localhost:${getBackendPort()}/`];
+}
+
+function backendHealthUrls() {
+  return backendBaseUrls().flatMap((baseUrl) => [urlWithPath(baseUrl, '/health'), urlWithPath(baseUrl, '/api/health')]);
+}
+
+function urlWithPath(baseUrl: string, route: string) {
+  return new URL(route.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function safeArtifactName(value: string) {
+  return value.replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'artifact';
+}
+
+async function fetchFirstOk(urls: string[], signal?: AbortSignal) {
+  let lastMessage = '';
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      const body = await response.text();
+      if (response.ok) {
+        return { ok: true as const, url, status: response.status, body };
+      }
+      lastMessage = `${url} returned ${response.status}: ${truncate(body, 800)}`;
+    } catch (error) {
+      lastMessage = `${url}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  return { ok: false as const, url: urls[0] || '', status: 0, body: '', message: lastMessage || 'No URL returned a successful response.' };
+}
+
+async function hasGeneratedProductContract(codeDir: string) {
+  return (
+    (await pathExists(path.join(codeDir, 'frontend', 'app', 'products'))) ||
+    (await generatedProjectMentions(codeDir, /\/api\/products|api\/products|\/products\/\{|\bproducts\/\[id\]/i))
+  );
+}
+
+async function requiresRealProductMedia(codeDir: string) {
+  if (!(await hasGeneratedProductContract(codeDir))) return false;
+  const text = await generatedProjectTextSearchBlob(codeDir);
+  return /main[_-]?image|thumbnail|productimage|product-image|imagegallery|image gallery|hero(?:section)?|watch|wristwatch|timepiece|chronograph/i.test(text);
+}
+
+type PreparedMediaManifest = {
+  assets?: Partial<PreparedMediaAsset>[];
+};
+
+function isPreparedMediaAsset(value: Partial<PreparedMediaAsset>): value is PreparedMediaAsset {
+  return Boolean(value.title && value.path && value.publicUrl && value.sourceImageUrl && value.mimeType && typeof value.sizeBytes === 'number');
+}
+
+async function readPreparedMediaAssetsManifest(codeDir: string) {
+  const manifest = await readJsonFile<PreparedMediaManifest>(path.join(codeDir, PREPARED_MEDIA_MANIFEST_RELATIVE_PATH));
+  return (manifest?.assets ?? []).filter(isPreparedMediaAsset);
+}
+
+function preparedMediaAssetReferences(assets: PreparedMediaAsset[]) {
+  return Array.from(
+    new Set(
+      assets.flatMap((asset) => [
+        asset.publicUrl,
+        encodeURI(asset.publicUrl),
+        asset.path.replace(/^frontend\/public/u, '').replace(/\\/g, '/')
+      ])
+    )
+  ).filter(Boolean);
+}
+
+function containsAnyTextReference(output: string, references: string[]) {
+  const haystack = output.toLowerCase();
+  return references.some((reference) => haystack.includes(reference.toLowerCase()));
+}
+
+function isGenericPlaceholderImageReference(value: string) {
+  return /picsum\.photos|placehold\.co|via\.placeholder|placeholder\.com|dummyimage|loremflickr|source\.unsplash\.com\/random/i.test(value);
+}
+
+function isPreparedGeneratedMediaPath(filePath: string) {
+  return filePath.replace(/\\/g, '/').toLowerCase().includes('/assets/generated-media/');
+}
+
+async function referencedGeneratedImageAssetSummary(codeDir: string, options?: { excludePreparedMedia?: boolean }) {
+  const imageFiles = await findImageAssetFiles(codeDir);
+  if (imageFiles.length === 0) {
+    return { referenced: [] as string[], invalid: [] as string[] };
+  }
+
+  const sourceText = await generatedProjectTextSearchBlob(codeDir);
+  const referencedImageFiles = imageFiles.filter((filePath) => {
+    if (options?.excludePreparedMedia && isPreparedGeneratedMediaPath(filePath)) return false;
+    return imageAssetIsReferenced(codeDir, filePath, sourceText);
+  });
+  const invalid: string[] = [];
+
+  for (const filePath of referencedImageFiles) {
+    const relativePath = path.relative(codeDir, filePath).replace(/\\/g, '/');
+    const buffer = await fs.readFile(filePath);
+    const actual = sniffImageFormat(buffer);
+    const finding = imageSignatureMismatchMessage(relativePath, actual);
+    if (finding) invalid.push(finding);
+  }
+
+  return {
+    referenced: referencedImageFiles.map((filePath) => path.relative(codeDir, filePath).replace(/\\/g, '/')),
+    invalid
+  };
+}
+
+function configuredBrowserExecutableCandidates() {
+  return [
+    process.env.GENERATED_BROWSER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
+    process.env.BROWSER,
+    process.platform === 'win32' && process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+    process.platform === 'win32' && process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe') : '',
+    process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '',
+    process.platform === 'darwin' ? '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' : '',
+    'google-chrome',
+    'google-chrome-stable',
+    'chromium',
+    'chromium-browser',
+    'microsoft-edge',
+    'msedge'
+  ].filter((value): value is string => Boolean(value?.trim()));
+}
+
+function looksLikeFilePath(value: string) {
+  return path.isAbsolute(value) || /[\\/]/.test(value);
+}
+
+async function findHeadlessBrowserExecutable() {
+  for (const candidate of configuredBrowserExecutableCandidates()) {
+    if (looksLikeFilePath(candidate)) {
+      if (await pathExists(candidate)) return candidate;
+      continue;
+    }
+
+    const probe = await runCommand(candidate, ['--version'], process.cwd(), 10_000, undefined, undefined, 2_000);
+    if (probe.ok) return candidate;
+  }
+
+  return null;
+}
+
+function extractVisibleTextFromHtml(html: string) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractDomEvidence(output: string) {
+  const marker = 'DOM evidence:\n';
+  const markerIndex = output.indexOf(marker);
+  if (markerIndex < 0) return null;
+
+  try {
+    return JSON.parse(output.slice(markerIndex + marker.length)) as {
+      text?: string;
+      html?: string;
+      productLinks?: string[];
+      images?: Array<{ src?: string; alt?: string; complete?: boolean; naturalWidth?: number; naturalHeight?: number }>;
+      brokenImages?: Array<{ src?: string; alt?: string; complete?: boolean; naturalWidth?: number; naturalHeight?: number }>;
+      imageCount?: number;
+      productNavigation?: { attempted?: boolean; before?: string; after?: string; navigated?: boolean; hasDetailSignal?: boolean; reason?: string };
+      galleryInteraction?: { attempted?: boolean; changed?: boolean; mainBefore?: string; mainAfter?: string; imageCount?: number; reason?: string };
+    };
+  } catch {
+    return null;
+  }
+}
+
+function hasUsableRenderedMedia(domEvidence: ReturnType<typeof extractDomEvidence>) {
+  const renderedImages = domEvidence?.images ?? [];
+  const decodedImages = renderedImages.filter(
+    (image) => image.src && (image.naturalWidth ?? 0) > 0 && (image.naturalHeight ?? 0) > 0 && !isGenericPlaceholderImageReference(image.src)
+  );
+
+  return (decodedImages.length > 0 || (domEvidence?.imageCount ?? 0) > 0) && (domEvidence?.brokenImages?.length ?? 0) === 0;
+}
+
+function browserRuntimeFindings(
+  output: string,
+  options?: { expectProductList?: boolean; expectProductDetail?: boolean; preparedAssetReferences?: string[] }
+) {
+  const domEvidence = extractDomEvidence(output);
+  const visibleText = domEvidence?.text || output;
+  const domSearchText = [domEvidence?.text, domEvidence?.html, JSON.stringify(domEvidence?.brokenImages ?? []), JSON.stringify(domEvidence?.images ?? []), output].filter(Boolean).join('\n');
+  const findings = [...frontendRuntimeFindings(visibleText)];
+  const brokenImages = domEvidence?.brokenImages?.filter((image) => image.src) ?? [];
+  const checks = [
+    { pattern: /blocked by CORS policy|no ['"]access-control-allow-origin['"] header|access to fetch at .* from origin/i, message: 'browser reported a CORS-blocked frontend API request' },
+    { pattern: /TypeError:\s*Failed to fetch|Failed to fetch|net::ERR_FAILED|net::ERR_CONNECTION_REFUSED/i, message: 'browser reported a failed frontend network request' },
+    { pattern: /Uncaught \(in promise\)|RuntimeError|ReferenceError/i, message: 'browser console reported a runtime JavaScript error' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(output)) findings.push(check.message);
+  }
+
+  if (brokenImages.length > 0) {
+    const examples = brokenImages
+      .slice(0, 5)
+      .map((image) => `${image.alt || 'image'} (${image.src})`)
+      .join(', ');
+    findings.push(
+      `browser rendered ${brokenImages.length} broken image(s) with naturalWidth=0: ${examples}. Fix missing/corrupt frontend public image assets, URL paths, or MIME/extension mismatches.`
+    );
+  }
+
+  if (options?.expectProductList) {
+    if (isGenericPlaceholderImageReference(domSearchText)) {
+      findings.push('browser DOM uses generic placeholder image services instead of product-relevant/mockup-relevant imagery');
+    }
+
+    const hasProductDetailLink = Boolean(domEvidence?.productLinks?.length) || /href=["'][^"']*\/products\/[^"']+["']/i.test(domSearchText);
+    const hasProductCommerceSignal = /\$[0-9][0-9,.]*|view details|add to cart|product card|price/i.test(visibleText);
+    if (!hasProductDetailLink && !hasProductCommerceSignal) {
+      findings.push('browser DOM did not show product cards, product prices, or product-detail navigation after hydration');
+    }
+
+    if ((domEvidence?.imageCount ?? 0) === 0 && /product|price|\$[0-9]|watch|timepiece|collection/i.test(visibleText)) {
+      findings.push('browser DOM renders product/list content without any real image elements; product imagery must use prepared local media assets or relevant licensed images, not empty CSS placeholders');
+    }
+
+    if (domEvidence?.productNavigation) {
+      if (!domEvidence.productNavigation.attempted) {
+        findings.push(`browser could not find a clickable product card for list-to-detail navigation: ${domEvidence.productNavigation.reason || 'no reason recorded'}`);
+      } else if (!domEvidence.productNavigation.navigated || !domEvidence.productNavigation.hasDetailSignal) {
+        findings.push(
+          `clicking a product card did not navigate to a usable product detail page; before=${domEvidence.productNavigation.before || ''}, after=${domEvidence.productNavigation.after || ''}`
+        );
+      }
+    }
+  }
+
+  if (options?.expectProductDetail) {
+    if (isGenericPlaceholderImageReference(domSearchText)) {
+      findings.push('browser DOM uses generic placeholder image services instead of product-relevant/mockup-relevant imagery');
+    }
+
+    const hasDetailSignal = /\$[0-9][0-9,.]*|add to cart|specifications?|description|movement|calibre|details/i.test(visibleText);
+    if (!hasDetailSignal) {
+      findings.push('browser DOM did not show product detail content after hydration');
+    }
+
+    if ((domEvidence?.imageCount ?? 0) === 0 && /product|price|\$[0-9]|watch|timepiece|chronograph|specifications?/i.test(visibleText)) {
+      findings.push('browser DOM renders product detail content without any real image elements; product galleries must use prepared local media assets or relevant licensed images, not empty CSS placeholders');
+    }
+
+    if ((domEvidence?.imageCount ?? 0) > 0 && (domEvidence?.imageCount ?? 0) < 2 && /product|price|\$[0-9]|watch|timepiece|chronograph|specifications?/i.test(visibleText)) {
+      findings.push('browser DOM did not show a product detail gallery with both a main image and thumbnail images');
+    }
+
+    if (domEvidence?.galleryInteraction) {
+      if (!domEvidence.galleryInteraction.attempted) {
+        findings.push(`browser could not find a non-duplicate thumbnail image to exercise gallery interaction: ${domEvidence.galleryInteraction.reason || 'no reason recorded'}`);
+      } else if (!domEvidence.galleryInteraction.changed) {
+        findings.push(
+          `clicking a thumbnail did not update the main product image; before=${domEvidence.galleryInteraction.mainBefore || ''}, after=${domEvidence.galleryInteraction.mainAfter || ''}`
+        );
+      }
+    }
+  }
+
+  if ((options?.expectProductList || options?.expectProductDetail) && options.preparedAssetReferences?.length) {
+    if (!containsAnyTextReference(domSearchText, options.preparedAssetReferences) && !hasUsableRenderedMedia(domEvidence)) {
+      findings.push('browser DOM does not use prepared local media assets from /assets/generated-media');
+    }
+  }
+
+  return Array.from(new Set(findings));
+}
+
+function getFreeTcpPort() {
+  return new Promise<number>((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(port);
+      });
+    });
+  });
+}
+
+async function fetchJsonWithRetry<T>(url: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  const startedAt = Date.now();
+  let lastError = '';
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) throw new Error('Run canceled by user.');
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      if (response.ok) return (await response.json()) as T;
+      lastError = `${url} returned ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    await abortableDelay(250, signal);
+  }
+
+  throw new Error(lastError || `Timed out waiting for ${url}.`);
+}
+
+type CdpMessage = {
+  id?: number;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: { message?: string };
+};
+
+type CdpEvent = {
+  method: string;
+  params?: unknown;
+};
+
+class CdpSession {
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private events: CdpEvent[] = [];
+
+  private constructor(private readonly ws: WebSocket) {}
+
+  static connect(url: string) {
+    return new Promise<CdpSession>((resolve, reject) => {
+      if (typeof WebSocket !== 'function') {
+        reject(new Error('Global WebSocket is not available in this Node runtime.'));
+        return;
+      }
+
+      const ws = new WebSocket(url);
+      const session = new CdpSession(ws);
+
+      ws.addEventListener('open', () => resolve(session), { once: true });
+      ws.addEventListener('error', () => reject(new Error('Could not connect to Chrome DevTools Protocol.')), { once: true });
+      ws.addEventListener('message', (event) => session.handleMessage(event));
+      ws.addEventListener('close', () => session.rejectPending(new Error('Chrome DevTools Protocol connection closed.')));
+    });
+  }
+
+  send<T = unknown>(method: string, params?: Record<string, unknown>) {
+    const id = this.nextId;
+    this.nextId += 1;
+
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: (value) => resolve(value as T), reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  getEvents() {
+    return this.events.slice();
+  }
+
+  close() {
+    this.ws.close();
+  }
+
+  private handleMessage(event: MessageEvent) {
+    let message: CdpMessage;
+    try {
+      message = JSON.parse(String(event.data)) as CdpMessage;
+    } catch {
+      return;
+    }
+
+    if (typeof message.id === 'number') {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message || 'Chrome DevTools command failed.'));
+      else pending.resolve(message.result);
+      return;
+    }
+
+    if (message.method) {
+      this.events.push({ method: message.method, params: message.params });
+    }
+  }
+
+  private rejectPending(error: Error) {
+    for (const pending of Array.from(this.pending.values())) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+}
+
+function formatCdpEvents(events: CdpEvent[]) {
+  const lines: string[] = [];
+
+  for (const event of events) {
+    const params = event.params as Record<string, unknown> | undefined;
+    if (event.method === 'Runtime.consoleAPICalled') {
+      const args = Array.isArray(params?.args)
+        ? (params?.args as Array<Record<string, unknown>>).map((arg) => String(arg.value ?? arg.description ?? '')).filter(Boolean).join(' ')
+        : '';
+      if (args) lines.push(`console: ${args}`);
+    } else if (event.method === 'Runtime.exceptionThrown') {
+      const details = params?.exceptionDetails as Record<string, unknown> | undefined;
+      lines.push(`exception: ${String(details?.text || details?.exception || 'runtime exception')}`);
+    } else if (event.method === 'Log.entryAdded') {
+      const entry = params?.entry as Record<string, unknown> | undefined;
+      lines.push(`log: ${String(entry?.level || '')} ${String(entry?.text || '')}`);
+    } else if (event.method === 'Network.loadingFailed') {
+      lines.push(`network failed: ${String(params?.errorText || '')} ${String(params?.blockedReason || '')} ${String(params?.type || '')}`);
+    } else if (event.method === 'Network.responseReceived') {
+      const response = params?.response as Record<string, unknown> | undefined;
+      const status = Number(response?.status || 0);
+      const url = String(response?.url || '');
+      if (status >= 400 && (/\/api\/|_next\/image|\/products?/i.test(url))) {
+        lines.push(`network ${status}: ${url}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function waitForChromeTarget(port: number, signal?: AbortSignal) {
+  type ChromeTarget = { type?: string; webSocketDebuggerUrl?: string; url?: string };
+  const targets = await fetchJsonWithRetry<ChromeTarget[]>(`http://127.0.0.1:${port}/json/list`, 15_000, signal);
+  const page = targets.find((target) => target.type === 'page' && target.webSocketDebuggerUrl) || targets.find((target) => target.webSocketDebuggerUrl);
+  if (!page?.webSocketDebuggerUrl) throw new Error('Chrome DevTools target did not expose a websocket debugger URL.');
+  return page.webSocketDebuggerUrl;
+}
+
+async function collectBrowserPageEvidence(params: {
+  browser: string;
+  url: string;
+  codeDir: string;
+  logDir: string;
+  artifactName: string;
+  expectProductList?: boolean;
+  expectProductDetail?: boolean;
+  signal?: AbortSignal;
+}) {
+  const port = await getFreeTcpPort();
+  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), `${params.artifactName}-profile-`));
+  const screenshotFile = path.join(params.logDir, `${params.artifactName}.png`);
+  const args = [
+    '--headless=new',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--hide-scrollbars',
+    '--no-first-run',
+    '--no-default-browser-check',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profileDir}`,
+    '--window-size=1200,1600',
+    'about:blank'
+  ];
+  const child = spawn(params.browser, args, { cwd: params.codeDir, windowsHide: true });
+  let processOutput = '';
+
+  child.stdout?.on('data', (chunk: Buffer) => {
+    processOutput += chunk.toString();
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    processOutput += chunk.toString();
+  });
+
+  let session: CdpSession | null = null;
+  try {
+    const websocketUrl = await waitForChromeTarget(port, params.signal);
+    session = await CdpSession.connect(websocketUrl);
+    await session.send('Page.enable');
+    await session.send('Runtime.enable');
+    await session.send('Network.enable');
+    await session.send('Log.enable');
+    await session.send('Page.navigate', { url: params.url });
+    await abortableDelay(getBrowserValidationVirtualTimeBudgetMs(), params.signal);
+
+    const evaluation = await session.send<{ result?: { value?: unknown } }>('Runtime.evaluate', {
+      expression: `(() => {
+        const text = document.body ? document.body.innerText : '';
+        const html = document.documentElement ? document.documentElement.outerHTML : '';
+        const productLinks = Array.from(document.querySelectorAll('a[href*="/products/"]')).map((node) => node.href);
+        const images = Array.from(document.images).map((image) => ({
+          src: image.currentSrc || image.src,
+          alt: image.alt,
+          complete: image.complete,
+          naturalWidth: image.naturalWidth,
+          naturalHeight: image.naturalHeight
+        }));
+        return {
+          url: location.href,
+          title: document.title,
+          text,
+          bodyLength: text.length,
+          productLinks,
+          images: images.slice(0, 20),
+          brokenImages: images.filter((image) => !image.complete || image.naturalWidth === 0).slice(0, 10),
+          imageCount: images.length,
+          html: html.slice(0, 120000)
+        };
+      })()`,
+      returnByValue: true,
+      awaitPromise: true
+    });
+    const screenshot = await session.send<{ data?: string }>('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    if (screenshot.data) await fs.writeFile(screenshotFile, screenshot.data, 'base64');
+    const domEvidence = (evaluation.result?.value ?? {}) as Record<string, unknown>;
+
+    if (params.expectProductList) {
+      const navigation = await session.send<{ result?: { value?: unknown } }>('Runtime.evaluate', {
+        expression: `(async () => {
+          const before = location.href;
+          const candidates = Array.from(document.querySelectorAll('a[href*="/products/"], button, [role="button"], article, div'));
+          const productCard = candidates.find((node) => {
+            const text = (node.innerText || '').replace(/\\s+/g, ' ');
+            const cursor = getComputedStyle(node).cursor;
+            const href = node.href || node.getAttribute?.('href') || '';
+            return /\\/products\\//.test(href) || (cursor === 'pointer' && /\\$[0-9][0-9,.]*/.test(text) && /[A-Za-z]/.test(text));
+          });
+          if (!productCard) return { attempted: false, before, reason: 'no clickable product card or product detail link found' };
+          productCard.click();
+          await new Promise((resolve) => setTimeout(resolve, 2500));
+          const text = document.body ? document.body.innerText : '';
+          const images = Array.from(document.images);
+          return {
+            attempted: true,
+            before,
+            after: location.href,
+            navigated: /\\/products\\/[^/]+/.test(location.pathname),
+            hasDetailSignal: /\\$[0-9][0-9,.]*|add to cart|specifications?|movement|calibre|description/i.test(text),
+            imageCount: images.length,
+            brokenImageCount: images.filter((image) => !image.complete || image.naturalWidth === 0).length
+          };
+        })()`,
+        returnByValue: true,
+        awaitPromise: true
+      });
+      domEvidence.productNavigation = navigation.result?.value ?? { attempted: false, reason: 'product navigation probe did not return evidence' };
+    }
+
+    if (params.expectProductDetail) {
+      const gallery = await session.send<{ result?: { value?: unknown } }>('Runtime.evaluate', {
+        expression: `(async () => {
+          const images = Array.from(document.images);
+          const mainBefore = images[0]?.currentSrc || images[0]?.src || '';
+          const thumbnail = images.find((image, index) => index > 0 && (image.currentSrc || image.src) && (image.currentSrc || image.src) !== mainBefore);
+          if (!thumbnail) {
+            return {
+              attempted: false,
+              imageCount: images.length,
+              mainBefore,
+              reason: images.length <= 1 ? 'fewer than two rendered product images' : 'all thumbnails duplicate the main image'
+            };
+          }
+          thumbnail.click();
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          const mainAfter = document.images[0]?.currentSrc || document.images[0]?.src || '';
+          return {
+            attempted: true,
+            imageCount: document.images.length,
+            mainBefore,
+            mainAfter,
+            changed: mainBefore !== mainAfter
+          };
+        })()`,
+        returnByValue: true,
+        awaitPromise: true
+      });
+      domEvidence.galleryInteraction = gallery.result?.value ?? { attempted: false, reason: 'gallery interaction probe did not return evidence' };
+    }
+
+    return {
+      command: `${params.browser} ${args.join(' ')}`,
+      screenshotFile,
+      output: [
+        `URL: ${params.url}`,
+        `Screenshot: ${screenshotFile}`,
+        `Browser process output:\n${processOutput}`,
+        `CDP events:\n${formatCdpEvents(session.getEvents())}`,
+        `DOM evidence:\n${JSON.stringify(domEvidence, null, 2)}`
+      ].join('\n\n')
+    };
+  } finally {
+    session?.close();
+    child.kill();
+    await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function validateBrowserRenderedPage(params: {
+  name: string;
+  url: string;
+  codeDir: string;
+  logDir: string;
+  signal?: AbortSignal;
+  expectProductList?: boolean;
+  expectProductDetail?: boolean;
+  preparedAssetReferences?: string[];
+}): Promise<GeneratedValidationStep> {
+  if (!shouldRunBrowserValidation()) {
+    return skippedStep(params.name, 'VALIDATE_GENERATED_BROWSER=false; browser hydration validation was skipped.');
+  }
+
+  const browser = await findHeadlessBrowserExecutable();
+  if (!browser) {
+    return skippedStep(
+      params.name,
+      'No Chrome/Chromium/Edge executable was found, so browser hydration validation was skipped. Set GENERATED_BROWSER_EXECUTABLE_PATH to enable this check.'
+    );
+  }
+
+  await fs.mkdir(params.logDir, { recursive: true });
+  const artifactName = safeArtifactName(params.name);
+  const attempts = getBrowserValidationAttempts();
+  const browserErrors: string[] = [];
+  let evidence: { command: string; screenshotFile: string; output: string } | null = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      evidence = await collectBrowserPageEvidence({
+        browser,
+        url: params.url,
+        codeDir: params.codeDir,
+        logDir: params.logDir,
+        artifactName: attempt === 1 ? artifactName : `${artifactName}-attempt-${attempt}`,
+        expectProductList: params.expectProductList,
+        expectProductDetail: params.expectProductDetail,
+        signal: params.signal
+      });
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      browserErrors.push(`Attempt ${attempt}/${attempts}: ${message}`);
+      await writeLog(params.logDir, `${artifactName}-browser-error-attempt-${attempt}`, message);
+      if (params.signal?.aborted) break;
+      if (attempt < attempts) await abortableDelay(1_000, params.signal);
+    }
+  }
+
+  if (!evidence) {
+    const logFile = await writeLog(params.logDir, `${artifactName}-browser-error`, browserErrors.join('\n') || 'Browser validation failed without an error message.');
+    return {
+      name: params.name,
+      status: 'FAIL',
+      command: `${browser} --headless=new --remote-debugging-port=<dynamic> ${params.url}`,
+      logFile,
+      message: `Headless browser validation failed for ${params.url} after ${attempts} attempt(s). ${browserErrors.join(' | ')}`
+    };
+  }
+
+  const logFile = await writeLog(params.logDir, `${artifactName}-browser-evidence`, evidence.output);
+
+  const findings = browserRuntimeFindings(evidence.output, {
+    expectProductList: params.expectProductList,
+    expectProductDetail: params.expectProductDetail,
+    preparedAssetReferences: params.preparedAssetReferences
+  });
+
+  return findings.length > 0
+    ? {
+        name: params.name,
+        status: 'FAIL',
+        command: evidence.command,
+        logFile,
+        message: `Browser-rendered page failed after hydration at ${params.url}. Screenshot: ${evidence.screenshotFile}. Findings: ${findings.join('; ')}.`
+      }
+    : {
+        name: params.name,
+        status: 'PASS',
+        command: evidence.command,
+        logFile,
+        message: `Browser-rendered page passed after hydration at ${params.url}. Screenshot: ${evidence.screenshotFile}.`
+      };
+}
+
+const GENERATED_SCAN_EXTENSIONS = new Set([
+  '.css',
+  '.env',
+  '.example',
+  '.html',
+  '.js',
+  '.json',
+  '.jsx',
+  '.md',
+  '.mjs',
+  '.py',
+  '.ts',
+  '.tsx',
+  '.txt',
+  '.yaml',
+  '.yml'
+]);
+
+function shouldScanGeneratedTextFile(filePath: string) {
+  const name = path.basename(filePath).toLowerCase();
+  if (name === 'dockerfile' || name === 'containerfile' || name === '.env.example') return true;
+  return GENERATED_SCAN_EXTENSIONS.has(path.extname(name));
+}
+
+function shouldScanPreparedMediaUsageFile(filePath: string) {
+  const relativePath = filePath.replace(/\\/g, '/').toLowerCase();
+  if (relativePath.endsWith('/assets/generated-media/media-manifest.json')) return false;
+
+  return ['.css', '.html', '.js', '.json', '.jsx', '.mjs', '.py', '.ts', '.tsx'].includes(path.extname(filePath).toLowerCase());
+}
+
+async function generatedProjectContainsAnyPreparedMediaReference(dir: string, references: string[]): Promise<boolean> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (shouldSkipWorkspaceEntry(entry.name)) continue;
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (await generatedProjectContainsAnyPreparedMediaReference(entryPath, references)) return true;
+    } else if (entry.isFile() && shouldScanPreparedMediaUsageFile(entryPath)) {
+      try {
+        const stat = await fs.stat(entryPath);
+        if (stat.size > 1_000_000) continue;
+        if (containsAnyTextReference(await fs.readFile(entryPath, 'utf-8'), references)) return true;
+      } catch {
+        // Ignore unreadable generated files and continue scanning the rest.
+      }
+    }
+  }
+
+  return false;
+}
+
+async function validatePreparedMediaAssetUsage(codeDir: string, preparedAssets: PreparedMediaAsset[]): Promise<GeneratedValidationStep> {
+  if (preparedAssets.length === 0) {
+    if (await requiresRealProductMedia(codeDir)) {
+      return {
+        name: 'frontend prepared media usage smoke',
+        status: 'FAIL',
+        command: 'scan generated project for product media requirements and prepared /assets/generated-media manifest',
+        message:
+          'Generated product UI requires real product/hero/detail imagery, but no prepared local media asset manifest was found. Improve media acquisition or use relevant licensed image URLs; do not pass with empty CSS/image placeholders.'
+      };
+    }
+
+    return skippedStep('frontend prepared media usage smoke', 'No prepared local media asset manifest was found and no product media requirement was detected.');
+  }
+
+  const references = preparedMediaAssetReferences(preparedAssets);
+  const used = references.length > 0 && (await generatedProjectContainsAnyPreparedMediaReference(codeDir, references));
+
+  if (used) {
+    return {
+      name: 'frontend prepared media usage smoke',
+      status: 'PASS',
+      command: `scan generated project source for ${preparedAssets.length} prepared /assets/generated-media reference(s)`,
+      message: `Generated project source references prepared local media assets: ${preparedAssets.map((asset) => asset.publicUrl).join(', ')}`
+    };
+  }
+
+  const localMedia = await referencedGeneratedImageAssetSummary(codeDir, { excludePreparedMedia: true });
+  if (localMedia.referenced.length > 0 && localMedia.invalid.length === 0) {
+    return {
+      name: 'frontend prepared media usage smoke',
+      status: 'PASS',
+      command: `scan generated project source for prepared /assets/generated-media references or valid alternate local image assets`,
+      message: `Generated project does not reference /assets/generated-media, but it uses ${localMedia.referenced.length} valid referenced local image asset(s): ${localMedia.referenced
+        .slice(0, 6)
+        .join(', ')}`
+    };
+  }
+
+  return {
+    name: 'frontend prepared media usage smoke',
+    status: 'FAIL',
+    command: `scan generated project source for ${preparedAssets.length} prepared /assets/generated-media reference(s)`,
+    message:
+      'Prepared local media assets were downloaded for the run, but generated project source does not reference any /assets/generated-media URL or other valid referenced local image assets. Use the provided local publicUrl values in frontend code or backend seed data instead of placeholders or unrelated remote images.'
+  };
+}
+
+async function generatedProjectMentions(dir: string, pattern: RegExp): Promise<boolean> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (shouldSkipWorkspaceEntry(entry.name)) continue;
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (await generatedProjectMentions(entryPath, pattern)) return true;
+    } else if (entry.isFile() && shouldScanGeneratedTextFile(entryPath)) {
+      try {
+        const stat = await fs.stat(entryPath);
+        if (stat.size > 1_000_000) continue;
+        if (pattern.test(await fs.readFile(entryPath, 'utf-8'))) return true;
+      } catch {
+        // Ignore unreadable generated files; other validation steps will catch concrete runtime failures.
+      }
+    }
+  }
+
+  return false;
+}
+
+function frontendRuntimeFindings(html: string) {
+  const findings: string[] = [];
+  const checks = [
+    { pattern: /unable to load (?:products|items|data)|failed to fetch (?:products|items|data)|error fetching (?:products|items|data)/i, message: 'frontend rendered a data/API failure message' },
+    { pattern: /404\s+this page could not be found|this page could not be found/i, message: 'frontend rendered a Next.js 404 page' },
+    { pattern: /hydration failed|application error|runtime error/i, message: 'frontend rendered a runtime error state' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(html)) findings.push(check.message);
+  }
+
+  return findings;
+}
+
+function extractNextImageUrls(html: string, baseUrl: string) {
+  const urls = new Set<string>();
+  const matches = Array.from(html.matchAll(/\/_next\/image\?[^"'<>\s,)]+/gi));
+
+  for (const match of matches) {
+    const raw = match[0].replace(/&amp;/g, '&').replace(/&#x26;/g, '&');
+    try {
+      urls.add(new URL(raw, baseUrl).toString());
+    } catch {
+      // Ignore malformed candidates; they will be represented by broken UI checks where applicable.
+    }
+  }
+
+  return Array.from(urls);
+}
+
+function addResolvedImageUrl(urls: Set<string>, rawUrl: string, baseUrl: string) {
+  const trimmed = rawUrl.trim().replace(/^['"]|['"]$/g, '');
+  if (!trimmed || /^(?:data|blob|mailto|javascript):/iu.test(trimmed)) return;
+
+  try {
+    urls.add(new URL(trimmed.replace(/&amp;/g, '&').replace(/&#x26;/g, '&'), baseUrl).toString());
+  } catch {
+    // Ignore malformed candidates; browser evidence will represent visible failures.
+  }
+}
+
+function extractRenderedImageUrls(html: string, baseUrl: string) {
+  const urls = new Set<string>(extractNextImageUrls(html, baseUrl));
+
+  for (const match of Array.from(html.matchAll(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/giu))) {
+    addResolvedImageUrl(urls, match[1], baseUrl);
+  }
+
+  for (const match of Array.from(html.matchAll(/<source\b[^>]*\bsrcset=["']([^"']+)["'][^>]*>/giu))) {
+    for (const candidate of match[1].split(',')) {
+      addResolvedImageUrl(urls, candidate.trim().split(/\s+/u)[0] || '', baseUrl);
+    }
+  }
+
+  for (const match of Array.from(html.matchAll(/<link\b[^>]*\bas=["']image["'][^>]*\bhref=["']([^"']+)["'][^>]*>/giu))) {
+    addResolvedImageUrl(urls, match[1], baseUrl);
+  }
+
+  for (const match of Array.from(html.matchAll(/\burl\(([^)]+)\)/giu))) {
+    const candidate = match[1].trim().replace(/^['"]|['"]$/g, '');
+    if (IMAGE_ASSET_EXTENSIONS.has(path.extname(candidate.split(/[?#]/u)[0] || '').toLowerCase())) {
+      addResolvedImageUrl(urls, candidate, baseUrl);
+    }
+  }
+
+  return Array.from(urls);
+}
+
+function validateImageResponseSignature(url: string, contentType: string | null, buffer: Buffer) {
+  const actual = sniffImageFormat(buffer);
+  const responseFormat = imageFormatFromContentType(contentType);
+  const extensionFormat = imageFormatFromExtension(new URL(url).pathname);
+
+  if (actual === 'unknown') {
+    return `${url} returned ${contentType || 'unknown content-type'} but the response body is not a recognized image format.`;
+  }
+
+  if (responseFormat !== 'unknown' && responseFormat !== actual) {
+    return `${url} returned content-type ${contentType}, but the response body is ${imageFormatLabel(actual)}.`;
+  }
+
+  if (extensionFormat && extensionFormat !== actual) {
+    return `${url} has a ${path.extname(new URL(url).pathname)} extension, but the response body is ${imageFormatLabel(actual)}.`;
+  }
+
+  return null;
+}
+
+async function validateRenderedImageUrls(name: string, html: string, baseUrl: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  const imageUrls = extractRenderedImageUrls(html, baseUrl).slice(0, 20);
+  if (imageUrls.length === 0) {
+    return skippedStep(name, 'No rendered image URLs were found in the page HTML.');
+  }
+
+  const failures: string[] = [];
+  for (const url of imageUrls) {
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal });
+      if (!response.ok) {
+        const body = await response.text();
+        failures.push(`${url} returned ${response.status}: ${truncate(body, 500)}`);
+        continue;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const signatureFailure = validateImageResponseSignature(url, response.headers.get('content-type'), buffer);
+      if (signatureFailure) failures.push(signatureFailure);
+    } catch (error) {
+      failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return failures.length > 0
+    ? {
+        name,
+        status: 'FAIL',
+        command: imageUrls.map((url) => `GET ${url}`).join(' && '),
+        message: `Rendered image URLs must be fetchable and decodable. Failures:\n${failures.join('\n')}`
+      }
+    : {
+        name,
+        status: 'PASS',
+        command: imageUrls.map((url) => `GET ${url}`).join(' && '),
+        message: `Checked ${imageUrls.length} rendered image URL(s) for HTTP status and image signatures.`
+      };
+}
+
+async function validateNextImageUrls(name: string, html: string, baseUrl: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  return validateRenderedImageUrls(name, html, baseUrl, signal);
+}
+
+async function validateBackendProductApi(codeDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  if (!(await hasGeneratedProductContract(codeDir))) {
+    return skippedStep('backend product API smoke', 'No generated product API or product detail route contract was detected.');
+  }
+
+  const urls = backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products'));
+  const response = await fetchFirstOk(urls, signal);
+  if (!response.ok) {
+    return {
+      name: 'backend product API smoke',
+      status: 'FAIL',
+      command: urls.map((url) => `GET ${url}`).join(' || '),
+      message: `Generated files reference a product API, but /api/products is not reachable. ${response.message}`
+    };
+  }
+
+  try {
+    const data = JSON.parse(response.body);
+    if (!Array.isArray(data) || data.length === 0) {
+      return {
+        name: 'backend product API smoke',
+        status: 'FAIL',
+        command: `GET ${response.url}`,
+        message: '/api/products must return a non-empty JSON array when product listing/detail UI is generated.'
+      };
+    }
+  } catch {
+    return {
+      name: 'backend product API smoke',
+      status: 'FAIL',
+      command: `GET ${response.url}`,
+      message: `/api/products returned non-JSON content: ${truncate(response.body, 500)}`
+    };
+  }
+
+  return {
+    name: 'backend product API smoke',
+    status: 'PASS',
+    command: `GET ${response.url}`,
+    message: '/api/products returned a non-empty JSON array.'
+  };
+}
+
+async function validateBackendCorsForFrontendOrigins(codeDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  if (!(await hasGeneratedProductContract(codeDir))) {
+    return skippedStep('backend CORS browser-origin smoke', 'No generated browser product/API contract was detected.');
+  }
+
+  const apiUrls = backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products'));
+  const frontendOrigins = Array.from(new Set(frontendBaseUrls().map((baseUrl) => new URL(baseUrl).origin)));
+  const failures: string[] = [];
+  const passes: string[] = [];
+
+  for (const origin of frontendOrigins) {
+    let originPassed = false;
+    const originFailures: string[] = [];
+
+    for (const apiUrl of apiUrls) {
+      try {
+        const response = await fetch(apiUrl, {
+          cache: 'no-store',
+          headers: { Origin: origin },
+          signal
+        });
+        const allowOrigin = response.headers.get('access-control-allow-origin');
+        if (response.ok && (allowOrigin === origin || allowOrigin === '*')) {
+          passes.push(`${origin} -> ${apiUrl} allowed by ${allowOrigin}`);
+          originPassed = true;
+          break;
+        }
+
+        originFailures.push(`${origin} -> ${apiUrl} returned ${response.status} with access-control-allow-origin=${allowOrigin || '(missing)'}`);
+      } catch (error) {
+        originFailures.push(`${origin} -> ${apiUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (!originPassed) {
+      failures.push(...originFailures);
+      failures.push(`Generated backend does not allow browser origin ${origin} for /api/products.`);
+    }
+  }
+
+  return failures.length > 0
+    ? {
+        name: 'backend CORS browser-origin smoke',
+        status: 'FAIL',
+        command: frontendOrigins.map((origin) => `GET /api/products Origin:${origin}`).join(' && '),
+        message: `Backend API must allow the generated frontend origins used by browser validation. Failures:\n${failures.join('\n')}`
+      }
+    : {
+        name: 'backend CORS browser-origin smoke',
+        status: 'PASS',
+        command: frontendOrigins.map((origin) => `GET /api/products Origin:${origin}`).join(' && '),
+        message: `Backend CORS allows generated frontend origins:\n${passes.join('\n')}`
+      };
+}
+
+function productDetailPathFromProduct(value: unknown) {
+  if (!value || typeof value !== 'object') return null;
+  const product = value as Record<string, unknown>;
+  const rawId = product.id ?? product.productId ?? product.productID ?? product._id ?? product.slug;
+  const id = typeof rawId === 'number' && Number.isFinite(rawId) ? String(rawId) : typeof rawId === 'string' ? rawId.trim() : '';
+  return id ? `/products/${encodeURIComponent(id)}` : null;
+}
+
+function productDetailPathFromProductsPayload(body: string) {
+  try {
+    const payload = JSON.parse(body) as unknown;
+    const products = Array.isArray(payload)
+      ? payload
+      : payload && typeof payload === 'object'
+        ? (['products', 'items', 'data', 'content'] as const)
+            .map((key) => (payload as Record<string, unknown>)[key])
+            .find((value): value is unknown[] => Array.isArray(value))
+        : null;
+    return products?.map(productDetailPathFromProduct).find((value): value is string => Boolean(value)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function firstBackendProductDetailPath(signal?: AbortSignal) {
+  const urls = backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products'));
+  const response = await fetchFirstOk(urls, signal);
+  return response.ok ? productDetailPathFromProductsPayload(response.body) : null;
+}
+
+function extractFirstProductDetailPath(html: string) {
+  const match = html.match(/href=["'](\/products\/[^"']+)["']/i);
+  return match?.[1] ?? null;
+}
+
+async function validateFrontendRuntimeSmoke(codeDir: string, logDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep[]> {
+  const steps: GeneratedValidationStep[] = [];
+  const homeUrls = frontendBaseUrls();
+  const preparedMediaAssets = await readPreparedMediaAssetsManifest(codeDir);
+  const preparedAssetReferences = preparedMediaAssetReferences(preparedMediaAssets);
+  const home = await fetchFirstOk(homeUrls, signal);
+
+  if (!home.ok) {
+    return [
+      {
+        name: 'frontend rendered content smoke',
+        status: 'FAIL',
+        command: homeUrls.map((url) => `GET ${url}`).join(' || '),
+        message: `Frontend route did not return usable HTML. ${home.message}`
+      }
+    ];
+  }
+
+  const homeFindings = frontendRuntimeFindings(extractVisibleTextFromHtml(home.body));
+  steps.push(
+    homeFindings.length > 0
+      ? {
+          name: 'frontend rendered content smoke',
+          status: 'FAIL',
+          command: `GET ${home.url}`,
+          message: `Frontend returned 200 but rendered blocking runtime/data failure(s): ${homeFindings.join('; ')}.`
+        }
+      : {
+          name: 'frontend rendered content smoke',
+          status: 'PASS',
+          command: `GET ${home.url}`,
+          message: 'Frontend home route returned 200 without obvious runtime/data failure text.'
+        }
+  );
+
+  steps.push(await validateRenderedImageUrls('frontend home image smoke', home.body, home.url, signal));
+  steps.push(await validatePreparedMediaAssetUsage(codeDir, preparedMediaAssets));
+
+  const hasProductDetailRoute = (await hasGeneratedProductContract(codeDir)) || /href=["']\/products\//i.test(home.body);
+  steps.push(
+    await validateBrowserRenderedPage({
+      name: 'frontend browser home smoke',
+      url: home.url,
+      codeDir,
+      logDir,
+      signal,
+      expectProductList: hasProductDetailRoute,
+      preparedAssetReferences
+    })
+  );
+
+  if (!hasProductDetailRoute) {
+    steps.push(skippedStep('frontend product detail smoke', 'No generated product detail route was detected.'));
+    return steps;
+  }
+
+  const detailPath = extractFirstProductDetailPath(home.body) ?? (await firstBackendProductDetailPath(signal));
+  if (!detailPath) {
+    steps.push({
+      name: 'frontend product detail smoke',
+      status: 'FAIL',
+      command: `scan frontend HTML for /products/<id> links or GET ${backendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, '/api/products')).join(' || GET ')}`,
+      message: 'Generated product detail route was detected, but validation could not derive a concrete /products/<id> path from rendered HTML or the first backend product payload.'
+    });
+    return steps;
+  }
+
+  const detailUrls = frontendBaseUrls().map((baseUrl) => urlWithPath(baseUrl, detailPath));
+  const detail = await fetchFirstOk(detailUrls, signal);
+  if (!detail.ok) {
+    steps.push({
+      name: 'frontend product detail smoke',
+      status: 'FAIL',
+      command: detailUrls.map((url) => `GET ${url}`).join(' || '),
+      message: `Generated product detail route is not reachable at ${detailPath}. ${detail.message}`
+    });
+    return steps;
+  }
+
+  const detailFindings = frontendRuntimeFindings(extractVisibleTextFromHtml(detail.body));
+  steps.push(
+    detailFindings.length > 0
+      ? {
+          name: 'frontend product detail smoke',
+          status: 'FAIL',
+          command: `GET ${detail.url}`,
+          message: `Product detail route returned 200 but rendered blocking runtime/data failure(s): ${detailFindings.join('; ')}.`
+        }
+      : {
+          name: 'frontend product detail smoke',
+          status: 'PASS',
+          command: `GET ${detail.url}`,
+          message: `Product detail route ${detailPath} returned 200 without obvious runtime/data failure text.`
+        }
+  );
+  steps.push(await validateRenderedImageUrls('frontend detail image smoke', detail.body, detail.url, signal));
+  steps.push(
+    await validateBrowserRenderedPage({
+      name: 'frontend browser product detail smoke',
+      url: detail.url,
+      codeDir,
+      logDir,
+      signal,
+      expectProductDetail: true,
+      preparedAssetReferences
+    })
+  );
+
+  return steps;
+}
+
+function runtimeLogFindings(output: string) {
+  const findings: string[] = [];
+  const checks = [
+    { pattern: /Error fetching (?:products|product|items|item|data)/i, message: 'frontend server logs contain generated data fetch errors' },
+    { pattern: /TypeError:\s*fetch failed/i, message: 'frontend server logs contain fetch failed errors' },
+    { pattern: /ECONNREFUSED[\s\S]{0,300}(?:localhost|127\.0\.0\.1):(55080|8000|8080|8081)|(?:localhost|127\.0\.0\.1):(55080|8000|8080|8081)[\s\S]{0,300}ECONNREFUSED/i, message: 'frontend container appears to call localhost for the backend instead of the Compose service name' },
+    { pattern: /url["']?\s+parameter is not allowed|INVALID_IMAGE_OPTIMIZE_REQUEST|upstream image response failed|ImageError/i, message: 'frontend server logs contain image optimization failures' }
+  ];
+
+  for (const check of checks) {
+    if (check.pattern.test(output)) findings.push(check.message);
+  }
+
+  return findings;
+}
+
+async function validateRuntimeLogs(engine: ComposeEngine, codeDir: string, composeFile: string, logDir: string, signal?: AbortSignal): Promise<GeneratedValidationStep> {
+  const logs = await collectComposeLogsForEngine(engine, codeDir, composeFile, logDir, signal);
+  const findings = runtimeLogFindings(logs.output);
+
+  return findings.length > 0
+    ? {
+        name: `${engine.name} runtime log smoke`,
+        status: 'FAIL',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')}`,
+        logFile: logs.logFile,
+        message: `Runtime logs contain blocking generated-app failures: ${findings.join('; ')}.\n${truncate(logs.output, 2400)}`
+      }
+    : {
+        name: `${engine.name} runtime log smoke`,
+        status: 'PASS',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')}`,
+        logFile: logs.logFile,
+        message: 'Runtime logs do not contain known blocking generated-app fetch or image failures.'
+      };
 }
 
 async function collectComposeLogsForEngine(engine: ComposeEngine, codeDir: string, composeFile: string, logDir: string, signal?: AbortSignal) {
@@ -779,6 +2326,9 @@ async function cleanupGeneratedComposeProject(
   }
 
   const args = [...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'down', '--remove-orphans'];
+  if (shouldRemoveGeneratedComposeVolumes()) {
+    args.push('--volumes');
+  }
   if (shouldRemoveGeneratedComposeImages()) {
     args.push('--rmi', 'local');
   }
@@ -798,10 +2348,298 @@ async function cleanupGeneratedComposeProject(
     ...step,
     message:
       step.status === 'PASS'
-        ? shouldRemoveGeneratedComposeImages()
-          ? 'Removed previous generated Compose containers, networks, orphans, and local generated images for this project name.'
-          : 'Removed previous generated Compose containers, networks, and orphans for this project name.'
+        ? [
+            'Removed previous generated Compose containers, networks, and orphans for this project name',
+            shouldRemoveGeneratedComposeVolumes() ? 'removed generated volumes to avoid stale SQLite/runtime data' : '',
+            shouldRemoveGeneratedComposeImages() ? 'removed local generated images' : ''
+          ]
+            .filter(Boolean)
+            .join('; ') + '.'
         : step.message
+  };
+}
+
+interface ComposeHostPortMapping {
+  service: string;
+  hostPort: number;
+  containerPort?: number;
+  protocol?: string;
+  raw: string;
+}
+
+interface HostPortOwner {
+  name: string;
+  ports: string;
+}
+
+function parseComposePortNumber(value: string | undefined) {
+  if (!value) return null;
+  const normalized = value.trim().replace(/^["']|["']$/g, '');
+  const envDefault = normalized.match(/^\$\{[A-Z0-9_]+:-(\d+)\}$/iu);
+  if (envDefault) return Number(envDefault[1]);
+  const number = Number(normalized);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function parseShortComposePort(rawValue: string, service: string): ComposeHostPortMapping | null {
+  const raw = rawValue.trim().replace(/^["']|["']$/g, '').replace(/\/[a-z]+$/iu, '');
+  if (!raw || raw.startsWith('mode:')) return null;
+
+  const parts = raw.split(':');
+  if (parts.length < 2) return null;
+
+  const hostPart = parts[parts.length - 2];
+  const containerPart = parts[parts.length - 1];
+  const hostPort = parseComposePortNumber(hostPart);
+  if (!hostPort) return null;
+
+  return {
+    service,
+    hostPort,
+    containerPort: parseComposePortNumber(containerPart) ?? undefined,
+    raw: rawValue.trim()
+  };
+}
+
+function parseComposeConfigHostPorts(configOutput: string): ComposeHostPortMapping[] {
+  const mappings: ComposeHostPortMapping[] = [];
+  let inServices = false;
+  let currentService = '';
+  let inPorts = false;
+  let pending: Partial<ComposeHostPortMapping> | null = null;
+
+  const flushPending = () => {
+    if (pending?.service && pending.hostPort) {
+      mappings.push({
+        service: pending.service,
+        hostPort: pending.hostPort,
+        containerPort: pending.containerPort,
+        protocol: pending.protocol,
+        raw: pending.raw || `${pending.hostPort}:${pending.containerPort || ''}`
+      });
+    }
+    pending = null;
+  };
+
+  for (const line of configOutput.split(/\r?\n/u)) {
+    if (/^services:\s*$/u.test(line)) {
+      inServices = true;
+      currentService = '';
+      inPorts = false;
+      flushPending();
+      continue;
+    }
+
+    if (inServices && /^\S/u.test(line) && !/^services:\s*$/u.test(line)) {
+      inServices = false;
+      currentService = '';
+      inPorts = false;
+      flushPending();
+    }
+
+    if (!inServices) continue;
+
+    const serviceMatch = line.match(/^ {2}([a-z0-9_.-]+):\s*$/iu);
+    if (serviceMatch) {
+      currentService = serviceMatch[1];
+      inPorts = false;
+      flushPending();
+      continue;
+    }
+
+    if (!currentService) continue;
+
+    if (/^ {4}ports:\s*$/u.test(line)) {
+      inPorts = true;
+      flushPending();
+      continue;
+    }
+
+    if (inPorts && /^ {4}\S/u.test(line) && !/^ {4}ports:\s*$/u.test(line)) {
+      inPorts = false;
+      flushPending();
+    }
+
+    if (!inPorts) continue;
+
+    const itemMatch = line.match(/^ {6}-\s*(.+?)\s*$/u);
+    if (itemMatch) {
+      flushPending();
+      const shortPort = parseShortComposePort(itemMatch[1], currentService);
+      if (shortPort) {
+        mappings.push(shortPort);
+      } else {
+        pending = { service: currentService, raw: itemMatch[1].trim() };
+      }
+      continue;
+    }
+
+    const propertyMatch = line.match(/^ {8}(published|target|protocol):\s*(.+?)\s*$/u);
+    if (propertyMatch && pending) {
+      const key = propertyMatch[1];
+      const value = propertyMatch[2].trim().replace(/^["']|["']$/g, '');
+      if (key === 'published') pending.hostPort = parseComposePortNumber(value) ?? undefined;
+      if (key === 'target') pending.containerPort = parseComposePortNumber(value) ?? undefined;
+      if (key === 'protocol') pending.protocol = value;
+    }
+  }
+
+  flushPending();
+  return mappings;
+}
+
+function parseDockerPortOwners(output: string): Map<number, HostPortOwner[]> {
+  const owners = new Map<number, HostPortOwner[]>();
+  for (const line of output.split(/\r?\n/u)) {
+    const [name, ports = ''] = line.split('\t');
+    if (!name?.trim()) continue;
+
+    for (const match of Array.from(ports.matchAll(/(?:(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::1):)(\d+)->/gu))) {
+      const port = Number(match[1]);
+      if (!Number.isFinite(port)) continue;
+      const list = owners.get(port) ?? [];
+      list.push({ name: name.trim(), ports: ports.trim() });
+      owners.set(port, list);
+    }
+  }
+
+  return owners;
+}
+
+async function listHostPortOwners(engine: ComposeEngine, codeDir: string, signal?: AbortSignal) {
+  const result = await runCommand(engine.command, ['ps', '--format', '{{.Names}}\t{{.Ports}}'], codeDir, 30_000, undefined, signal);
+  if (!result.ok) return new Map<number, HostPortOwner[]>();
+  return parseDockerPortOwners(result.output);
+}
+
+function canBindHostPort(port: number) {
+  return new Promise<boolean>((resolve) => {
+    const server = net.createServer();
+    server.once('error', () => resolve(false));
+    server.listen({ host: '0.0.0.0', port, exclusive: true }, () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+function portMappingLabel(mapping: ComposeHostPortMapping) {
+  const target = mapping.containerPort ? ` -> container ${mapping.containerPort}` : '';
+  return `${mapping.service} host ${mapping.hostPort}${target}`;
+}
+
+function generatedServiceKind(service: string) {
+  const normalized = service.toLowerCase();
+  if (normalized === 'frontend' || normalized.includes('front') || normalized.includes('web') || normalized.includes('ui')) return 'frontend';
+  if (normalized === 'backend' || normalized.includes('back') || normalized.includes('api') || normalized.includes('server')) return 'backend';
+  return 'other';
+}
+
+function nonGeneratedOwners(owners: HostPortOwner[] | undefined) {
+  return (owners ?? []).filter((owner) => !owner.name.startsWith(`${COMPOSE_PROJECT_NAME}-`));
+}
+
+async function validateComposeHostPortPreflight(
+  engine: ComposeEngine,
+  codeDir: string,
+  composeFile: string,
+  logDir: string,
+  signal?: AbortSignal
+): Promise<GeneratedValidationStep> {
+  const config = await runCommand(engine.command, [...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'config'], codeDir, 30_000, undefined, signal);
+  if (!config.ok) {
+    return {
+      name: `${engine.name} host port preflight`,
+      status: 'FAIL',
+      command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'config'].join(' ')}`,
+      message: `Could not resolve Compose ports before startup.\n${config.error || 'Command failed.'}\n${truncate(maskSecrets(config.output), 2_000)}`
+    };
+  }
+
+  const mappings = parseComposeConfigHostPorts(config.output);
+  if (mappings.length === 0) {
+    return skippedStep(`${engine.name} host port preflight`, 'Compose config does not publish host ports.');
+  }
+
+  const frontendMapping = mappings.find((mapping) => generatedServiceKind(mapping.service) === 'frontend');
+  const backendMapping = mappings.find((mapping) => generatedServiceKind(mapping.service) === 'backend');
+  const expectedMismatches = [
+    frontendMapping && frontendMapping.hostPort !== getFrontendPort()
+      ? `frontend publishes host ${frontendMapping.hostPort}, but GENERATED_FRONTEND_PORT expects ${getFrontendPort()}`
+      : '',
+    backendMapping && backendMapping.hostPort !== getBackendPort()
+      ? `backend publishes host ${backendMapping.hostPort}, but GENERATED_BACKEND_PORT expects ${getBackendPort()}`
+      : ''
+  ].filter(Boolean);
+
+  if (expectedMismatches.length > 0) {
+    const logFile = await writeLog(
+      logDir,
+      `${engine.name.replace(/\s+/g, '-')}-validation-port-contract`,
+      [
+        'Generated Compose ports do not match execution validation ports:',
+        ...expectedMismatches.map((mismatch) => `- ${mismatch}`),
+        '',
+        'Repair guidance:',
+        '- Keep generated Compose, .env.example, frontend browser API URLs, and the app-level GENERATED_* validation env aligned.',
+        `- Default generated app ports are frontend ${DEFAULT_GENERATED_FRONTEND_HOST_PORT}, backend ${DEFAULT_GENERATED_BACKEND_HOST_PORT}, and database ${DEFAULT_GENERATED_DATABASE_HOST_PORT}.`
+      ].join('\n')
+    );
+
+    return {
+      name: `${engine.name} validation port contract`,
+      status: 'FAIL',
+      command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'config'].join(' ')}`,
+      logFile,
+      message: `Execution validation is configured for different host ports than generated Compose publishes:\n${expectedMismatches.map((mismatch) => `- ${mismatch}`).join('\n')}`
+    };
+  }
+
+  const ownersByPort = await listHostPortOwners(engine, codeDir, signal);
+  const conflicts: string[] = [];
+  for (const mapping of mappings) {
+    const allOwners = ownersByPort.get(mapping.hostPort);
+    const owners = nonGeneratedOwners(allOwners);
+    if (owners.length > 0) {
+      conflicts.push(`${portMappingLabel(mapping)} is already published by ${owners.map((owner) => `${owner.name} (${owner.ports})`).join(', ')}`);
+      continue;
+    }
+
+    if (allOwners?.some((owner) => owner.name.startsWith(`${COMPOSE_PROJECT_NAME}-`))) {
+      continue;
+    }
+
+    if (!(await canBindHostPort(mapping.hostPort))) {
+      conflicts.push(`${portMappingLabel(mapping)} is already in use by a local process or Docker proxy that is not part of ${COMPOSE_PROJECT_NAME}.`);
+    }
+  }
+
+  if (conflicts.length > 0) {
+    const logFile = await writeLog(
+      logDir,
+      `${engine.name.replace(/\s+/g, '-')}-host-port-preflight`,
+      [
+        'Generated Compose host port conflicts:',
+        ...conflicts.map((conflict) => `- ${conflict}`),
+        '',
+        `This validator only cleans up the generated Compose project (${COMPOSE_PROJECT_NAME}). It will not stop unrelated containers or local processes.`,
+        `Use generated-app host ports in the 55xxx range, such as frontend ${DEFAULT_GENERATED_FRONTEND_HOST_PORT}, backend ${DEFAULT_GENERATED_BACKEND_HOST_PORT}, and database ${DEFAULT_GENERATED_DATABASE_HOST_PORT}.`
+      ].join('\n')
+    );
+
+    return {
+      name: `${engine.name} host port preflight`,
+      status: 'FAIL',
+      command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'config'].join(' ')} && ${engine.command} ps --format ...`,
+      logFile,
+      message: `Generated Compose cannot start because required host ports are occupied by unrelated runtime resources:\n${conflicts.map((conflict) => `- ${conflict}`).join('\n')}`
+    };
+  }
+
+  return {
+    name: `${engine.name} host port preflight`,
+    status: 'PASS',
+    command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'config'].join(' ')} && ${engine.command} ps --format ...`,
+    message: `Host ports are available for generated Compose: ${mappings.map(portMappingLabel).join(', ')}.`
   };
 }
 
@@ -906,6 +2744,18 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
       return steps;
     }
 
+    const hostPortPreflight = await validateComposeHostPortPreflight(engine, codeDir, composeFile, logDir, signal);
+    steps.push(hostPortPreflight);
+    if (hostPortPreflight.status === 'FAIL') {
+      await onProgress?.({
+        stepId: 'execution-validation',
+        stepStatus: 'FAIL',
+        level: 'error',
+        message: 'Generated Compose host port preflight failed before startup. Free the unrelated port owner or update generated host ports.'
+      });
+      return steps;
+    }
+
     const buildArgs =
       engine.name === 'docker compose'
         ? [...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'build', '--progress=plain']
@@ -975,14 +2825,14 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
         status: 'FAIL',
         command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')} && ${engine.command} ps/inspect`,
         logFile: logs.logFile,
-        message: `Captured ${engine.name} logs and container health diagnostics after startup failure.\n${truncate(logs.output, 2400)}`
+        message: composeDiagnosticsMessage(engine.name, 'startup failure', logs.output)
       });
       return steps;
     }
 
     const backendHealth = await waitForHttp(
       'backend health',
-      [`http://127.0.0.1:${getBackendPort()}/health`, `http://localhost:${getBackendPort()}/health`],
+      backendHealthUrls(),
       HEALTH_TIMEOUT_MS,
       onProgress,
       signal
@@ -991,7 +2841,7 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
 
     const frontendHealth = await waitForHttp(
       'frontend health',
-      [`http://127.0.0.1:${getFrontendPort()}/`, `http://localhost:${getFrontendPort()}/`],
+      frontendBaseUrls(),
       HEALTH_TIMEOUT_MS,
       onProgress,
       signal
@@ -1005,7 +2855,27 @@ async function validateWithDockerCompose(codeDir: string, composeFile: string, l
         status: 'FAIL',
         command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')} && ${engine.command} ps/inspect`,
         logFile: logs.logFile,
-        message: `Captured ${engine.name} logs and container health diagnostics after healthcheck failure.\n${truncate(logs.output, 2400)}`
+        message: composeDiagnosticsMessage(engine.name, 'healthcheck failure', logs.output)
+      });
+      return steps;
+    }
+
+    const runtimeSmokeSteps: GeneratedValidationStep[] = [
+      await validateBackendProductApi(codeDir, signal),
+      await validateBackendCorsForFrontendOrigins(codeDir, signal),
+      ...(await validateFrontendRuntimeSmoke(codeDir, logDir, signal)),
+      await validateRuntimeLogs(engine, codeDir, composeFile, logDir, signal)
+    ];
+    steps.push(...runtimeSmokeSteps);
+
+    if (runtimeSmokeSteps.some((step) => step.status === 'FAIL')) {
+      const logs = await collectComposeDiagnosticsForEngine(engine, codeDir, composeFile, logDir, signal);
+      steps.push({
+        name: `${engine.name} diagnostics`,
+        status: 'FAIL',
+        command: `${engine.command} ${[...engine.baseArgs, '-f', composeFile, '-p', COMPOSE_PROJECT_NAME, 'logs', '--tail=150'].join(' ')} && ${engine.command} ps/inspect`,
+        logFile: logs.logFile,
+        message: composeDiagnosticsMessage(engine.name, 'runtime smoke failure', logs.output)
       });
       return steps;
     }
@@ -1129,7 +2999,7 @@ function buildResult(params: {
   const allExecutionSkipped = executionSteps.length > 0 && executionSteps.every((step) => step.status === 'SKIPPED');
   const hasInfrastructureSkip = executionSteps.some((step) => step.status === 'SKIPPED' && /environment\/runtime issue|compose engine is unavailable|rancher\/docker is not ready/i.test(step.message));
   const findings = failedSteps.map((step) => `${step.name}: ${step.message}`);
-  const status = params.skipped || allExecutionSkipped || hasInfrastructureSkip ? 'SKIPPED' : failedSteps.length > 0 ? 'NEEDS_FIX' : 'PASS';
+  const status = failedSteps.length > 0 ? 'NEEDS_FIX' : params.skipped || allExecutionSkipped || hasInfrastructureSkip ? 'SKIPPED' : 'PASS';
 
   return {
     status,
@@ -1177,7 +3047,11 @@ export async function validateGeneratedProjectExecution(onProgress?: RunProgress
     message: `Validation workspace created at ${codeDir}.`
   });
 
-  const steps: GeneratedValidationStep[] = [await copyEnvExampleIfSafe(codeDir)];
+  const steps: GeneratedValidationStep[] = [await copyEnvExampleIfSafe(codeDir), await validateStaticImageAssetIntegrity(codeDir, logDir)];
+  if (steps.some((step) => step.status === 'FAIL')) {
+    return addRepairScope(buildResult({ startedAt, workspace: codeDir, steps }));
+  }
+
   const composeFile = await resolveComposeFile(codeDir);
 
   if (composeFile) {

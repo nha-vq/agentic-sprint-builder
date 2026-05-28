@@ -72,9 +72,17 @@ for (const directory of ['frontend', 'backend']) {
   }
 }
 
-if (!contract.oneOfTopLevelDirectories?.some((group) => group.includes('database') && group.includes('db'))) {
-  throw new Error('DEV skill contract must require database/ or db/.');
+if (contract.oneOfTopLevelDirectories?.some((group) => group.includes('database') || group.includes('db'))) {
+  throw new Error('DEV skill machine contract must not unconditionally require database/ or db/ because SQLite is backend-owned file persistence.');
 }
+
+const composePatterns = contract.requiredContentChecks?.find((check) => check.path === 'docker-compose.yml')?.patterns || [];
+if (composePatterns.some((pattern) => pattern.includes('(database|db):'))) {
+  throw new Error('DEV skill machine contract must not unconditionally require a database/db Compose service; service-database rules belong in skill guidance.');
+}
+
+assertIncludes(devSkill, 'Never place JSX event props such as `onClick`', 'DEV skill must block Server Component event handlers.');
+assertIncludes(devSkill, 'Do not create a fake database service for SQLite', 'DEV skill must handle SQLite as stack-specific backend-owned persistence.');
 
 const devAgent = 'lib/agents/dev-agent.ts';
 for (const phrase of [

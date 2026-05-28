@@ -70,12 +70,12 @@ AUTO_START_RANCHER_DESKTOP=true
 RANCHER_DESKTOP_PATH=
 RANCHER_RDCTL_PATH=
 RANCHER_START_CONTAINER_ENGINE=moby
-RANCHER_START_KUBERNETES=false
+RANCHER_START_KUBERNETES=true
 RANCHER_START_IN_BACKGROUND=true
 RANCHER_START_TIMEOUT_MS=600000
 RANCHER_READY_POLL_MS=3000
-GENERATED_BACKEND_PORT=8000
-GENERATED_FRONTEND_PORT=3001
+GENERATED_BACKEND_PORT=55080
+GENERATED_FRONTEND_PORT=55001
 CLEAN_GENERATED_COMPOSE=true
 REMOVE_GENERATED_COMPOSE_IMAGES=false
 RUN_FULL_QA_AGENT=true
@@ -196,7 +196,7 @@ app/runs/[runId]/page.tsx        # Per-run output UI
 11. Run artifacts are written under `generated-runs/{yyyy-MM-dd-HH-mm-ss}`.
 12. DEV-generated source files are written to the fixed `generated-code/` workspace.
 13. If `VALIDATE_GENERATED_EXECUTION` is not `false`, the generated project is copied into an ignored validation workspace, then built, started, and smoke-checked. Compose validation tries `docker compose` first, then Rancher/containerd `nerdctl compose`; set `GENERATED_COMPOSE_ENGINE=docker` or `GENERATED_COMPOSE_ENGINE=nerdctl` to force one. If Compose is skipped because Docker/Rancher is unavailable, `FALLBACK_LOCAL_VALIDATION_WHEN_COMPOSE_SKIPPED=true` runs local Node/Python validation instead of blocking the whole run.
-14. At run start, `AUTO_START_RANCHER_DESKTOP=true` prewarms Rancher/Docker in the background while BA/DEV agents run. Before Compose validation, the orchestrator checks whether the selected Compose engine and container runtime are ready. If not, it starts Rancher Desktop with `rdctl` when available, waits up to `RANCHER_START_TIMEOUT_MS`, then runs Compose. Set `RANCHER_RDCTL_PATH` or `RANCHER_DESKTOP_PATH` if Rancher Desktop is installed in a custom location.
+14. At run start, `AUTO_START_RANCHER_DESKTOP=true` prewarms Rancher/Docker in the background while BA/DEV agents run. Before Compose validation, the orchestrator checks whether the selected Compose engine and container runtime are ready. If not, it starts Rancher Desktop with `rdctl` when available, waits up to `RANCHER_START_TIMEOUT_MS`, then runs Compose. `RANCHER_START_KUBERNETES=true` keeps Rancher Desktop Kubernetes available; omit the variable to preserve the current Rancher setting. Set `RANCHER_RDCTL_PATH` or `RANCHER_DESKTOP_PATH` if Rancher Desktop is installed in a custom location.
 15. Before each Compose validation, `CLEAN_GENERATED_COMPOSE=true` runs `compose down --remove-orphans` for the `agentic-sprint-builder-generated` project name to free ports from the previous generated run. It does not remove unrelated containers. Set `REMOVE_GENERATED_COMPOSE_IMAGES=true` to also remove local images for that generated Compose project.
 16. By default, QA runs after deploy smoke validation. Set `RUN_FULL_QA_AGENT=false` only when you want deploy smoke validation to be the acceptance gate without full QA review.
 

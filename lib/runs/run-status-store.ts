@@ -5,6 +5,7 @@ const MAX_LOGS = 500;
 const DEFAULT_STEPS: RunProgressStep[] = [
   { id: 'ba', label: 'BA analysis', status: 'PENDING' },
   { id: 'tech-stack', label: 'Tech stack prep', status: 'PENDING' },
+  { id: 'ux', label: 'UX contract', status: 'PENDING' },
   { id: 'dev', label: 'DEV lead', status: 'PENDING' },
   { id: 'frontend-dev', label: 'Frontend DEV', status: 'PENDING' },
   { id: 'backend-dev', label: 'Backend DEV', status: 'PENDING' },
@@ -101,7 +102,11 @@ export function updateRunProgress(runId: string, update: RunProgressUpdate) {
 export function completeRunStatus(runId: string, result: RunResult) {
   const snapshot = runs.get(runId) ?? createRunStatus(runId, result.topic);
   if (snapshot.status === 'CANCELED') return snapshot;
-  const hasBlockingIssues = result.executionValidation?.status === 'NEEDS_FIX' || result.qaStatus === 'NEEDS_FIX';
+  const hasBlockingIssues =
+    result.executionValidation?.status === 'NEEDS_FIX' ||
+    result.qaStatus === 'NEEDS_FIX' ||
+    result.deployValidationStatus === 'NEEDS_FIX' ||
+    result.codeReviewStatus === 'NEEDS_FIX';
 
   snapshot.status = 'COMPLETED';
   snapshot.updatedAt = now();

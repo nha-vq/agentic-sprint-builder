@@ -5,6 +5,7 @@ import { createTimestampRunId, runSprintBuilder } from '@/lib/orchestrator';
 import { AGENT_MODEL_IDS } from '@/lib/agent-models';
 import { clearRunController, completeRunStatus, createRunStatus, failRunStatus, isRunCanceled, registerRunController, updateRunProgress } from '@/lib/runs/run-status-store';
 import { ApiGuardError, assertRunApiAccess } from '@/lib/security/api-guard';
+import { saveFailedRunSnapshot } from '@/lib/storage/file-writer';
 
 export const runtime = 'nodejs';
 export const maxDuration = 900;
@@ -24,6 +25,7 @@ const AgentModelsSchema = z
   .object({
     ba: AgentModelSchema.optional(),
     'tech-stack': AgentModelSchema.optional(),
+    ux: AgentModelSchema.optional(),
     dev: AgentModelSchema.optional(),
     'frontend-dev': AgentModelSchema.optional(),
     'backend-dev': AgentModelSchema.optional(),
@@ -102,7 +104,12 @@ export async function POST(request: NextRequest) {
         clearRunController(runId);
         if (isRunCanceled(runId)) return;
         console.error('[runs] Background run failed', error);
-        failRunStatus(runId, error);
+        const failed = failRunStatus(runId, error);
+        if (failed) {
+          void saveFailedRunSnapshot(failed, error).catch((saveError) => {
+            console.error('[runs] Failed to persist failed run snapshot', saveError);
+          });
+        }
       });
 
     updateRunProgress(runId, {

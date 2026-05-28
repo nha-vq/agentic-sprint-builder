@@ -139,6 +139,7 @@ export async function runPrepareTechStackAgent(input: {
   baOutput: string;
   existingFiles?: GeneratedFile[];
   recentRuns?: RunResult[];
+  validationFeedback?: string;
   modelOverride?: string;
   signal?: AbortSignal;
 }): Promise<PreparedTechStackOutput> {
@@ -158,12 +159,17 @@ export async function runPrepareTechStackAgent(input: {
     userPrompt: `
 Run prepare-tech-stack now using the loaded skill.
 Do not skip this step. If information is incomplete, use the safe-default behavior defined in the loaded skill and record assumptions.
+If USER TECH SPEC OR STACK HINTS names concrete technologies, those choices are binding. The selected frontendFramework, backendFramework, database, ORM/migration tool, package manager, Docker strategy, and devSkillGuidance must explicitly include those technologies unless the user requirements directly contradict them. Existing generated-code history is context, not permission to keep a conflicting stack.
+For generated Docker Compose apps, choose configurable high host ports by default to avoid collisions with existing local stacks: frontend 55001, backend 55080, and database 55432 when a database is exposed. Do not choose 3000, 3001, 5432, 5433, 8000, 8080, or 8081 as host ports unless the user explicitly requires them.
 
 USER REQUIREMENTS:
 ${input.requirements}
 
 USER TECH SPEC OR STACK HINTS:
 ${techSpec}
+
+PREVIOUS PREPARE-TECH-STACK VALIDATION FEEDBACK:
+${input.validationFeedback?.trim() || 'None.'}
 
 BA OUTPUT:
 ${input.baOutput}

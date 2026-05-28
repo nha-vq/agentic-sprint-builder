@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { RUN_LIMITS } from '@/lib/config/limits';
-import type { GeneratedFile, RunResult } from '@/lib/types';
+import type { GeneratedFile, RunResult, RunStatusSnapshot } from '@/lib/types';
 
 function getGeneratedRunsDir() {
   return path.resolve(process.cwd(), 'generated-runs');
@@ -62,6 +62,32 @@ function validateGeneratedFiles(files: GeneratedFile[]) {
   }
 }
 
+const TEXT_FILE_EXTENSIONS = new Set([
+  '.css',
+  '.env',
+  '.example',
+  '.html',
+  '.js',
+  '.json',
+  '.jsx',
+  '.md',
+  '.mjs',
+  '.py',
+  '.bash',
+  '.sh',
+  '.ts',
+  '.tsx',
+  '.txt',
+  '.yaml',
+  '.yml'
+]);
+
+function shouldCollectGeneratedTextFile(filePath: string) {
+  const name = path.basename(filePath).toLowerCase();
+  if (name === 'dockerfile' || name === 'containerfile' || name === '.dockerignore' || name === '.env.example') return true;
+  return TEXT_FILE_EXTENSIONS.has(path.extname(name));
+}
+
 async function collectFiles(dir: string, baseDir = dir): Promise<GeneratedFile[]> {
   let entries;
   try {
@@ -93,6 +119,7 @@ async function collectFiles(dir: string, baseDir = dir): Promise<GeneratedFile[]
     }
 
     if (!entry.isFile()) continue;
+    if (!shouldCollectGeneratedTextFile(fullPath)) continue;
 
     const stat = await fs.stat(fullPath);
     if (stat.size > RUN_LIMITS.generatedFileBytes) continue;
@@ -141,9 +168,51 @@ export async function saveRunResult(result: RunResult) {
   const resultWithOutputDir = { ...result, outputDir };
 
   await fs.mkdir(outputDir, { recursive: true });
+  if (result.specArtifacts?.length) {
+    for (const artifact of result.specArtifacts) {
+      const specPath = artifact.path.startsWith('specs/') ? artifact.path : `specs/${path.basename(artifact.path)}`;
+      const destination = resolveGeneratedFilePath(outputDir, specPath);
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.writeFile(destination, artifact.content, 'utf-8');
+    }
+  }
   await fs.writeFile(path.join(outputDir, 'run-result.json'), JSON.stringify(resultWithOutputDir, null, 2));
   await fs.writeFile(path.join(outputDir, 'BA_ARTIFACTS.md'), result.baOutput);
   await fs.writeFile(path.join(outputDir, 'QA_REPORT.md'), result.qaOutput);
+
+  return outputDir;
+}
+
+export async function saveFailedRunSnapshot(snapshot: RunStatusSnapshot, error: unknown) {
+  const outputDir = getRunOutputDir(snapshot.runId);
+  const message = error instanceof Error ? error.message : String(error);
+  const payload = {
+    ...snapshot,
+    outputDir,
+    error: snapshot.error || message,
+    failure: {
+      message,
+      stack: error instanceof Error ? error.stack : undefined,
+      savedAt: new Date().toISOString()
+    }
+  };
+
+  await fs.mkdir(outputDir, { recursive: true });
+  await fs.writeFile(path.join(outputDir, 'run-status.json'), JSON.stringify(payload, null, 2), 'utf-8');
+  await fs.writeFile(
+    path.join(outputDir, 'FAILURE_REPORT.md'),
+    [
+      `# Failed Run ${snapshot.runId}`,
+      '',
+      `Status: ${snapshot.status}`,
+      `Current step: ${snapshot.currentStepId || 'unknown'}`,
+      `Error: ${message}`,
+      '',
+      '## Logs',
+      ...snapshot.logs.map((log) => `- ${log.timestamp} [${log.level}] ${log.message}`)
+    ].join('\n'),
+    'utf-8'
+  );
 
   return outputDir;
 }

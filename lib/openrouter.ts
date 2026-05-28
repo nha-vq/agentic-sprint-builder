@@ -40,6 +40,19 @@ interface OpenRouterRequestBody {
   };
 }
 
+export interface OpenRouterRetryOptions {
+  maxRetries?: number;
+  retryDelayMs?: number;
+  retryBackoffMultiplier?: number;
+}
+
+export class OpenRouterEmptyContentError extends Error {
+  constructor(message = 'OpenRouter response did not include content') {
+    super(message);
+    this.name = 'OpenRouterEmptyContentError';
+  }
+}
+
 interface OpenRouterResponse {
   id?: string;
   choices?: Array<{
@@ -58,6 +71,7 @@ interface OpenRouterResponse {
 
 const DEFAULT_MODEL = 'google/gemini-2.5-pro';
 const DEFAULT_MAX_TOKENS = 65_536;
+const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
 const MODEL_PRICING_PER_TOKEN: Record<string, { prompt: number; completion: number }> = {
   'google/gemini-2.5-flash': { prompt: 0.0000003, completion: 0.0000025 },
   'google/gemini-2.5-pro': { prompt: 0.00000125, completion: 0.00001 },
@@ -83,7 +97,74 @@ function readPositiveIntEnv(name: string, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
+function readPositiveFloatEnv(name: string, fallback: number) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Run canceled by user.'));
+      return;
+    }
+
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timeout);
+        reject(new Error('Run canceled by user.'));
+      },
+      { once: true }
+    );
+  });
+}
+
+function createRequestSignal(signal?: AbortSignal) {
+  const timeoutMs = readPositiveIntEnv('OPENROUTER_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`OpenRouter request timed out after ${timeoutMs}ms.`));
+  }, timeoutMs);
+
+  const abortFromInput = () => {
+    controller.abort(signal?.reason ?? new Error('Run canceled by user.'));
+  };
+
+  if (signal?.aborted) {
+    abortFromInput();
+  } else {
+    signal?.addEventListener('abort', abortFromInput, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abortFromInput);
+    }
+  };
+}
+
+function isRetryableOpenRouterError(error: unknown) {
+  if (error instanceof OpenRouterEmptyContentError) return true;
+  if (!(error instanceof Error)) return false;
+  return /OpenRouter error (408|409|425|429|5\d\d)|fetch failed|ECONNRESET|ETIMEDOUT|timeout|network|temporar|rate limit/i.test(error.message);
+}
+
+export function getOpenRouterRetryOptions(overrides?: OpenRouterRetryOptions) {
+  return {
+    maxRetries: overrides?.maxRetries ?? readPositiveIntEnv('LLM_MAX_RETRIES', 2),
+    retryDelayMs: overrides?.retryDelayMs ?? readPositiveIntEnv('LLM_RETRY_DELAY_MS', 1500),
+    retryBackoffMultiplier: overrides?.retryBackoffMultiplier ?? readPositiveFloatEnv('LLM_RETRY_BACKOFF_MULTIPLIER', 2)
+  };
+}
+
+async function callOpenRouterOnce(input: OpenRouterInput): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY?.trim();
   if (!apiKey || /^(your_openrouter_api_key|placeholder|changeme)$/i.test(apiKey)) {
     throw new Error('Missing OPENROUTER_API_KEY. Add it to .env.local.');
@@ -131,28 +212,35 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
     // Anthropic models handle JSON via system prompt; no json_schema param needed
   }
 
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:3000',
-      'X-Title': process.env.OPENROUTER_APP_NAME || 'Agentic Sprint Builder'
-    },
-    body: JSON.stringify(requestBody),
-    signal: input.signal
-  });
+  const requestSignal = createRequestSignal(input.signal);
+  let data: OpenRouterResponse;
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:3000',
+        'X-Title': process.env.OPENROUTER_APP_NAME || 'Agentic Sprint Builder'
+      },
+      body: JSON.stringify(requestBody),
+      signal: requestSignal.signal
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(`OpenRouter authentication failed (${response.status}). Check OPENROUTER_API_KEY in .env.local or .env. Provider response: ${errorText}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(`OpenRouter authentication failed (${response.status}). Check OPENROUTER_API_KEY in .env.local or .env. Provider response: ${errorText}`);
+      }
+
+      throw new Error(`OpenRouter error ${response.status}: ${errorText}`);
     }
 
-    throw new Error(`OpenRouter error ${response.status}: ${errorText}`);
+    data = (await response.json()) as OpenRouterResponse;
+  } finally {
+    requestSignal.cleanup();
   }
 
-  const data = (await response.json()) as OpenRouterResponse;
   const usage = data.usage;
   if (input.agentId && usage) {
     const promptTokens = numericUsageValue(usage.prompt_tokens);
@@ -187,5 +275,24 @@ export async function callOpenRouter(input: OpenRouterInput): Promise<string> {
     if (text) return text;
   }
 
-  throw new Error('OpenRouter response did not include content');
+  throw new OpenRouterEmptyContentError();
+}
+
+export async function callOpenRouter(input: OpenRouterInput & { retry?: OpenRouterRetryOptions }): Promise<string> {
+  const retry = getOpenRouterRetryOptions(input.retry);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= retry.maxRetries; attempt += 1) {
+    try {
+      return await callOpenRouterOnce(input);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableOpenRouterError(error) || attempt >= retry.maxRetries) break;
+
+      const delay = Math.round(retry.retryDelayMs * Math.pow(retry.retryBackoffMultiplier, attempt));
+      await sleep(delay, input.signal);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }

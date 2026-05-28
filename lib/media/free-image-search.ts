@@ -1,9 +1,10 @@
 import type { FreeImageCandidate } from '@/lib/types';
 
 const COMMONS_API_URL = 'https://commons.wikimedia.org/w/api.php';
+const OPENVERSE_IMAGES_API_URL = 'https://api.openverse.org/v1/images/';
 const SEARCH_TIMEOUT_MS = 7_500;
-const MAX_QUERIES = 3;
-const MAX_RESULTS_PER_QUERY = 6;
+const MAX_QUERIES = 8;
+const MAX_RESULTS_PER_QUERY = 10;
 
 const STOP_WORDS = new Set([
   'about',
@@ -20,6 +21,7 @@ const STOP_WORDS = new Set([
   'artifact',
   'based',
   'build',
+  'cart',
   'can',
   'create',
   'dashboard',
@@ -40,8 +42,10 @@ const STOP_WORDS = new Set([
   'image',
   'images',
   'implementation',
+  'implementing',
   'input',
   'into',
+  'layout',
   'need',
   'needs',
   'only',
@@ -55,6 +59,8 @@ const STOP_WORDS = new Set([
   'search',
   'should',
   'show',
+  'shopping',
+  'simple',
   'stack',
   'story',
   'tech',
@@ -90,6 +96,34 @@ const BLOCKED_TERMS = [
   'weapon'
 ];
 
+const GENERIC_QUERY_TERMS = new Set([
+  'collection',
+  'ecommerce',
+  'interface',
+  'luxury',
+  'modern',
+  'photo',
+  'product',
+  'safe',
+  'store'
+]);
+
+const WATCH_CONTEXT_TERMS = ['chronograph', 'clock', 'horology', 'mechanical', 'timepiece', 'timepieces', 'watch', 'watches', 'wristwatch', 'wristwatches'];
+
+const WATCH_REJECT_TERMS = [
+  'apartment',
+  'apartments',
+  'building',
+  'buildings',
+  'flat',
+  'flats',
+  'geograph',
+  'hotel',
+  'house',
+  'road',
+  'street'
+];
+
 type CommonsImageInfo = {
   url?: string;
   thumburl?: string;
@@ -106,6 +140,26 @@ type CommonsResponse = {
   query?: {
     pages?: Record<string, CommonsPage>;
   };
+};
+
+type OpenverseImage = {
+  title?: string;
+  foreign_landing_url?: string;
+  url?: string;
+  thumbnail?: string;
+  license?: string;
+  license_version?: string;
+  license_url?: string;
+  source?: string;
+  provider?: string;
+  mature?: boolean;
+  filetype?: string | null;
+  category?: string | null;
+  tags?: Array<{ name?: string }>;
+};
+
+type OpenverseResponse = {
+  results?: OpenverseImage[];
 };
 
 function decodeHtmlEntities(value: string) {
@@ -125,8 +179,9 @@ function metadataValue(info: CommonsImageInfo, key: string) {
 
 function isAllowedLicense(license: string) {
   if (!license) return false;
-  if (/non.?free|fair use|copyrighted|all rights reserved/i.test(license)) return false;
-  return /public domain|cc0|cc by|cc-by|cc by-sa|cc-by-sa|creative commons/i.test(license);
+  const normalized = license.toLowerCase();
+  if (/non.?free|fair use|copyrighted|all rights reserved|noncommercial|\bnc\b|no derivatives|\bnd\b/i.test(normalized)) return false;
+  return /public domain|publicdomain|pdm|cc0|cc by|cc-by|cc by-sa|cc-by-sa|creative commons|\bby\b|\bby-sa\b/i.test(normalized);
 }
 
 function isSafeText(value: string) {
@@ -140,6 +195,38 @@ function isSupportedImage(info: CommonsImageInfo) {
   if (!url.startsWith('https://')) return false;
   if (mime && (!mime.startsWith('image/') || mime === 'image/svg+xml' || mime === 'image/gif')) return false;
   return !/\.(svg|gif|tif|tiff)(\?|$)/i.test(url);
+}
+
+function isSupportedImageUrl(url: string, mimeOrExtension?: string | null) {
+  if (!url.startsWith('https://')) return false;
+  if (mimeOrExtension && /svg|gif|tiff?|bmp/i.test(mimeOrExtension)) return false;
+  return !/\.(svg|gif|tif|tiff|bmp)(\?|$)/i.test(url);
+}
+
+function candidateSearchText(candidate: Pick<FreeImageCandidate, 'title' | 'imageUrl' | 'pageUrl'>) {
+  return `${candidate.title} ${candidate.imageUrl} ${candidate.pageUrl}`.toLowerCase().replace(/[_-]+/g, ' ');
+}
+
+function significantQueryTerms(query: string) {
+  return (
+    query
+      .match(/[A-Za-z][A-Za-z0-9-]{2,}/g)
+      ?.map(normalizeKeyword)
+      .filter((term) => term && !STOP_WORDS.has(term) && !GENERIC_QUERY_TERMS.has(term)) ?? []
+  );
+}
+
+function isRelevantCandidate(query: string, candidate: Pick<FreeImageCandidate, 'title' | 'imageUrl' | 'pageUrl'>) {
+  const queryTerms = significantQueryTerms(query);
+  if (queryTerms.length === 0) return true;
+
+  const text = candidateSearchText(candidate);
+  const watchQuery = queryTerms.some((term) => WATCH_CONTEXT_TERMS.includes(term));
+  if (watchQuery) {
+    return WATCH_CONTEXT_TERMS.some((term) => text.includes(term)) && !WATCH_REJECT_TERMS.some((term) => text.includes(term));
+  }
+
+  return queryTerms.some((term) => text.includes(term));
 }
 
 function normalizeKeyword(value: string) {
@@ -185,17 +272,87 @@ function extractTitleQuery(text: string) {
   return words?.join(' ') || '';
 }
 
+function cleanSubjectPhrase(value: string) {
+  const words =
+    value
+      .match(/[A-Za-z][A-Za-z0-9-]{1,}/g)
+      ?.map(normalizeKeyword)
+      .filter((word) => word && !STOP_WORDS.has(word) && !/^(full|stack|frontend|backend|ui|ux|nfrs?|mockups?|screenshots?)$/.test(word))
+      .slice(0, 4) ?? [];
+
+  return words.join(' ');
+}
+
+function extractDomainQueries(text: string) {
+  const normalized = text.toLowerCase();
+
+  if (/\b(?:watch|watches|wristwatch|wristwatches|timepiece|timepieces)\b/i.test(text)) {
+    return [
+      'wristwatch',
+      'chronograph watch',
+      'mechanical watch movement',
+      'luxury wristwatch product photo',
+      'watch dial macro',
+      'watch movement macro'
+    ];
+  }
+
+  const subjectPatterns = [
+    /\bbuild\s+(?:a|an|the)?\s*(?:full-stack\s+)?(.{3,80}?)(?:\s+(?:shopping cart|e-?commerce|store|shop|catalog|product|app|application)\b)/i,
+    /\b(?:store|shop|catalog|marketplace)\s+(?:for|of)\s+(.{3,80}?)(?:[.\n]|$)/i,
+    /\b(?:products?|items?)\s+(?:for|of)\s+(.{3,80}?)(?:[.\n]|$)/i
+  ];
+
+  for (const pattern of subjectPatterns) {
+    const subject = cleanSubjectPhrase(pattern.exec(text)?.[1] || '');
+    if (subject) {
+      return [`${subject} product photo`, `${subject} product collection`, `${subject} ecommerce product`];
+    }
+  }
+
+  const domainKeywords = extractKeywords(normalized).filter(
+    (word) => !/^(home|detail|header|footer|navigation|navbar|menu|mockup|wireframe|screen|screens|pages?)$/.test(word)
+  );
+  const subject = domainKeywords.slice(0, 2).join(' ');
+  return subject ? [`${subject} product photo`, `${subject} product collection`] : [];
+}
+
 function buildQueries(params: { requirements: string; techSpec?: string | null; topic?: string }) {
   const text = `${params.topic || ''}\n${params.requirements}\n${params.techSpec || ''}`;
+  const domainQueries = extractDomainQueries(text);
   const keywords = extractKeywords(text);
   const titleQuery = extractTitleQuery(params.requirements);
   const baseQuery = titleQuery || keywords.slice(0, 4).join(' ') || params.topic || 'modern application';
   const secondaryQuery = keywords.slice(0, 5).join(' ');
 
-  return [baseQuery, secondaryQuery, `${baseQuery} mockup interface`]
+  return [...domainQueries, baseQuery, secondaryQuery, `${baseQuery} product photo`, `${baseQuery} product collection`, `${baseQuery} product interface`]
     .map((query) => query.trim().replace(/\s+/g, ' '))
     .filter((query, index, queries) => query.length > 0 && queries.indexOf(query) === index)
     .slice(0, MAX_QUERIES);
+}
+
+function formatOpenverseLicense(item: OpenverseImage) {
+  const license = item.license?.trim();
+  if (!license) return '';
+  const version = item.license_version?.trim();
+  if (/^(cc0|pdm|by|by-sa)$/i.test(license)) {
+    return version ? `CC ${license.toUpperCase()} ${version}` : `CC ${license.toUpperCase()}`;
+  }
+  return version ? `${license} ${version}` : license;
+}
+
+function openverseSearchText(item: OpenverseImage) {
+  return [
+    item.title,
+    item.url,
+    item.foreign_landing_url,
+    item.source,
+    item.provider,
+    item.category,
+    ...(item.tags?.map((tag) => tag.name) ?? [])
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 async function fetchCommonsCandidates(query: string, signal?: AbortSignal): Promise<FreeImageCandidate[]> {
@@ -240,18 +397,80 @@ async function fetchCommonsCandidates(query: string, signal?: AbortSignal): Prom
       const pageUrl = metadataValue(info, 'DescriptionUrl') || `https://commons.wikimedia.org/wiki/${encodeURIComponent(page.title || title).replace(/%20/g, '_')}`;
       const licenseUrl = metadataValue(info, 'LicenseUrl') || undefined;
 
-      return [
-        {
-          title,
-          pageUrl,
-          imageUrl: info.url!,
-          thumbUrl: info.thumburl,
-          license,
-          licenseUrl,
-          source: 'Wikimedia Commons' as const,
-          query
-        }
-      ];
+      const candidate = {
+        title,
+        pageUrl,
+        imageUrl: info.url!,
+        thumbUrl: info.thumburl,
+        license,
+        licenseUrl,
+        source: 'Wikimedia Commons' as const,
+        query
+      };
+
+      return isRelevantCandidate(query, candidate) ? [candidate] : [];
+    });
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+async function fetchOpenverseCandidates(query: string, signal?: AbortSignal): Promise<FreeImageCandidate[]> {
+  const params = new URLSearchParams({
+    q: query,
+    page_size: String(MAX_RESULTS_PER_QUERY),
+    mature: 'false'
+  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+
+  try {
+    const response = await fetch(`${OPENVERSE_IMAGES_API_URL}?${params.toString()}`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'agentic-sprint-builder/1.0'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) return [];
+
+    const payload = (await response.json()) as OpenverseResponse;
+    return (payload.results ?? []).flatMap((item) => {
+      const title = decodeHtmlEntities(item.title || '');
+      const imageUrl = item.url || '';
+      const pageUrl = item.foreign_landing_url || '';
+      const license = formatOpenverseLicense(item);
+      const safetyText = openverseSearchText(item);
+
+      if (
+        item.mature ||
+        !title ||
+        !imageUrl ||
+        !pageUrl ||
+        !isSafeText(safetyText) ||
+        !isSupportedImageUrl(imageUrl, item.filetype) ||
+        !isAllowedLicense(license)
+      ) {
+        return [];
+      }
+
+      const candidate = {
+        title,
+        pageUrl,
+        imageUrl,
+        thumbUrl: item.thumbnail,
+        license,
+        licenseUrl: item.license_url || undefined,
+        source: 'Openverse' as const,
+        query
+      };
+
+      return isRelevantCandidate(query, candidate) ? [candidate] : [];
     });
   } catch {
     return [];
@@ -269,7 +488,9 @@ export async function searchFreeSafeImages(params: {
   signal?: AbortSignal;
 }): Promise<FreeImageCandidate[]> {
   const queries = buildQueries(params);
-  const results = await Promise.all(queries.map((query) => fetchCommonsCandidates(query, params.signal)));
+  const results = await Promise.all(
+    queries.flatMap((query) => [fetchOpenverseCandidates(query, params.signal), fetchCommonsCandidates(query, params.signal)])
+  );
   const seen = new Set<string>();
   const candidates: FreeImageCandidate[] = [];
 

@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { runMarkdownSkillAgent } from './base-agent';
+import { formatUXContractForPrompt } from './ux-agent';
 import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { extractJsonObject } from '@/lib/utils/json';
-import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RequirementImage } from '@/lib/types';
+import type { DevOutput, GeneratedFile, PreparedTechStackOutput, RequirementImage, UXContractOutput } from '@/lib/types';
 
 const CodeReviewFindingSchema = z.object({
   category: z.string(),
@@ -78,6 +79,7 @@ export async function runCodeReviewAgent(input: {
   baOutput: string;
   devOutput: DevOutput;
   preparedTechStack?: PreparedTechStackOutput;
+  uxContract?: UXContractOutput | null;
   existingFiles?: GeneratedFile[];
   modelOverride?: string;
   signal?: AbortSignal;
@@ -113,6 +115,9 @@ ${truncate(input.baOutput, 6_000)}
 PREPARED TECH STACK:
 ${input.preparedTechStack ? JSON.stringify(input.preparedTechStack, null, 2) : 'Not provided'}
 
+STABLE UX/UI CONTRACT:
+${formatUXContractForPrompt(input.uxContract)}
+
 GENERATED PROJECT OVERVIEW:
 ${projectOverview}
 
@@ -122,8 +127,10 @@ ${truncate(input.devOutput.architecture, 2_000)}
 GENERATED FILES:
 ${truncate(fileList, 60_000)}
 
-Review for: architecture consistency, requirement coverage, visual design contract coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, security basics, Next.js App Router client/server boundaries, and Dockerfile COPY sources that do not exist in the generated project.
+Review for: architecture consistency, requirement coverage, UX contract coverage, visual design contract coverage, code quality, Docker setup, env usage, API consistency, frontend/backend integration, security basics, Next.js App Router client/server boundaries, and Dockerfile COPY sources that do not exist in the generated project.
 If requirement images are attached, use them only for source-level visual coverage review. Do not require screenshot or pixel-diff evidence, but flag obvious missing mockup-driven layout/style/component requirements from frontend files as requirement blockers.
+Do not mark implementation-style preferences as blocking. For example, using equivalent Tailwind utilities or CSS instead of custom Tailwind token class names is advisory unless the source proves a concrete visual mismatch, broken responsive layout, missing mockup section, or broken image.
+Do not mark Dockerfile optimization, redundant layer/COPY ordering, image-size suggestions, or general best practices as blocking unless the generated source proves a concrete build, startup, health, browser-runtime, or security failure.
 Return JSON only.
 `
   });
