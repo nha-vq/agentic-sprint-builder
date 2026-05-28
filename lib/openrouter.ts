@@ -71,6 +71,7 @@ interface OpenRouterResponse {
 
 const DEFAULT_MODEL = 'google/gemini-2.5-pro';
 const DEFAULT_MAX_TOKENS = 65_536;
+const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
 const MODEL_PRICING_PER_TOKEN: Record<string, { prompt: number; completion: number }> = {
   'google/gemini-2.5-flash': { prompt: 0.0000003, completion: 0.0000025 },
   'google/gemini-2.5-pro': { prompt: 0.00000125, completion: 0.00001 },
@@ -121,6 +122,32 @@ function sleep(ms: number, signal?: AbortSignal) {
       { once: true }
     );
   });
+}
+
+function createRequestSignal(signal?: AbortSignal) {
+  const timeoutMs = readPositiveIntEnv('OPENROUTER_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`OpenRouter request timed out after ${timeoutMs}ms.`));
+  }, timeoutMs);
+
+  const abortFromInput = () => {
+    controller.abort(signal?.reason ?? new Error('Run canceled by user.'));
+  };
+
+  if (signal?.aborted) {
+    abortFromInput();
+  } else {
+    signal?.addEventListener('abort', abortFromInput, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abortFromInput);
+    }
+  };
 }
 
 function isRetryableOpenRouterError(error: unknown) {
@@ -185,28 +212,35 @@ async function callOpenRouterOnce(input: OpenRouterInput): Promise<string> {
     // Anthropic models handle JSON via system prompt; no json_schema param needed
   }
 
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:3000',
-      'X-Title': process.env.OPENROUTER_APP_NAME || 'Agentic Sprint Builder'
-    },
-    body: JSON.stringify(requestBody),
-    signal: input.signal
-  });
+  const requestSignal = createRequestSignal(input.signal);
+  let data: OpenRouterResponse;
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:3000',
+        'X-Title': process.env.OPENROUTER_APP_NAME || 'Agentic Sprint Builder'
+      },
+      body: JSON.stringify(requestBody),
+      signal: requestSignal.signal
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(`OpenRouter authentication failed (${response.status}). Check OPENROUTER_API_KEY in .env.local or .env. Provider response: ${errorText}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(`OpenRouter authentication failed (${response.status}). Check OPENROUTER_API_KEY in .env.local or .env. Provider response: ${errorText}`);
+      }
+
+      throw new Error(`OpenRouter error ${response.status}: ${errorText}`);
     }
 
-    throw new Error(`OpenRouter error ${response.status}: ${errorText}`);
+    data = (await response.json()) as OpenRouterResponse;
+  } finally {
+    requestSignal.cleanup();
   }
 
-  const data = (await response.json()) as OpenRouterResponse;
   const usage = data.usage;
   if (input.agentId && usage) {
     const promptTokens = numericUsageValue(usage.prompt_tokens);

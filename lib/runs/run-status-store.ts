@@ -102,7 +102,11 @@ export function updateRunProgress(runId: string, update: RunProgressUpdate) {
 export function completeRunStatus(runId: string, result: RunResult) {
   const snapshot = runs.get(runId) ?? createRunStatus(runId, result.topic);
   if (snapshot.status === 'CANCELED') return snapshot;
-  const hasBlockingIssues = result.executionValidation?.status === 'NEEDS_FIX' || result.qaStatus === 'NEEDS_FIX';
+  const hasBlockingIssues =
+    result.executionValidation?.status === 'NEEDS_FIX' ||
+    result.qaStatus === 'NEEDS_FIX' ||
+    result.deployValidationStatus === 'NEEDS_FIX' ||
+    result.codeReviewStatus === 'NEEDS_FIX';
 
   snapshot.status = 'COMPLETED';
   snapshot.updatedAt = now();

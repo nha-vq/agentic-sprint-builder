@@ -666,6 +666,7 @@ function LiveRunStatus({
 }) {
   const runActive = status.status === 'QUEUED' || status.status === 'RUNNING';
   const frontendUrl = status.result ? getGeneratedFrontendUrl(status.result) : undefined;
+  const hasBlockingIssues = status.result ? resultHasBlockingIssues(status.result) : false;
   const logContainerRef = useRef<HTMLDivElement | null>(null);
   const costLabel = status.result?.costSummary ? formatUsd(status.result.costSummary.totalUsd) : null;
 
@@ -684,7 +685,7 @@ function LiveRunStatus({
     <section className="bg-white p-5">
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div>
-          <h2 className="text-2xl font-bold">{status.result ? 'Run completed' : 'Terminal console'}</h2>
+          <h2 className="text-2xl font-bold">{status.result ? (hasBlockingIssues ? 'Run finished with issues' : 'Run completed') : 'Terminal console'}</h2>
           <p className="mt-1 text-sm text-slate-500">
             {status.runId} - {status.status}
             {costLabel ? ` - Cost ${costLabel}` : ''}
@@ -717,10 +718,12 @@ function LiveRunStatus({
       </div>
 
       {status.result && (
-        <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
-          <p className="text-sm font-bold text-emerald-800">Everything finished.</p>
-          <p className="mt-1 text-sm text-emerald-700">
-            Total AI cost: {costLabel || '$0.0000'} across {status.result.costSummary?.totalCalls ?? 0} model call(s).
+        <div className={`mt-4 rounded-2xl border p-4 ${hasBlockingIssues ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'}`}>
+          <p className={`text-sm font-bold ${hasBlockingIssues ? 'text-amber-900' : 'text-emerald-800'}`}>
+            {hasBlockingIssues ? 'Generated app needs fixes.' : 'Everything finished.'}
+          </p>
+          <p className={`mt-1 text-sm ${hasBlockingIssues ? 'text-amber-800' : 'text-emerald-700'}`}>
+            {hasBlockingIssues ? 'Open the run output or observation report for the blocking findings.' : `Total AI cost: ${costLabel || '$0.0000'} across ${status.result.costSummary?.totalCalls ?? 0} model call(s).`}
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             {frontendUrl && (
@@ -760,6 +763,15 @@ function getGeneratedFrontendUrl(result: RunResult) {
 
   const frontendHealth = result.executionValidation?.steps.find((step) => step.name.toLowerCase().includes('frontend') && step.status === 'PASS');
   return firstUrl(frontendHealth?.message) || firstUrl(frontendHealth?.command);
+}
+
+function resultHasBlockingIssues(result: RunResult) {
+  return (
+    result.executionValidation?.status === 'NEEDS_FIX' ||
+    result.qaStatus === 'NEEDS_FIX' ||
+    result.deployValidationStatus === 'NEEDS_FIX' ||
+    result.codeReviewStatus === 'NEEDS_FIX'
+  );
 }
 
 function formatUsd(value: number) {
@@ -865,10 +877,11 @@ function RancherRuntimeToast({
 }
 
 function RunResultView({ result }: { result: RunResult }) {
+  const hasBlockingIssues = resultHasBlockingIssues(result);
   return (
     <section className="space-y-6">
       <div className="rounded-3xl bg-white p-6 shadow-sm">
-        <h2 className="text-2xl font-bold">Run completed</h2>
+        <h2 className="text-2xl font-bold">{hasBlockingIssues ? 'Run finished with issues' : 'Run completed'}</h2>
         <p className="mt-1 text-sm text-slate-500">Run ID: {result.runId}</p>
         <p className="mt-1 text-sm font-semibold text-slate-700">QA Status: {result.qaStatus || 'Not recorded'}</p>
         <p className="mt-1 text-sm text-slate-500">Code review fix iterations: {result.codeReviewFixIterations ?? 0}</p>
@@ -927,6 +940,7 @@ function RunResultView({ result }: { result: RunResult }) {
 
       <Artifact title="BA Artifacts" content={result.baOutput} />
       {result.uxContract ? <Artifact title="UX Contract" content={JSON.stringify(result.uxContract, null, 2)} /> : null}
+      {result.specArtifacts?.length ? <Artifact title="Spec-Driven Contracts" content={formatSpecArtifacts(result.specArtifacts)} /> : null}
       {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
       {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
       {result.costControlNotes?.length ? <Artifact title="Cost Controls" content={result.costControlNotes.map((note) => `- ${note}`).join('\n')} /> : null}
@@ -1000,6 +1014,10 @@ function formatAgentModels(models: AgentModelMap) {
   return Object.entries(models)
     .map(([agentId, model]) => `- ${agentId}: ${model}`)
     .join('\n');
+}
+
+function formatSpecArtifacts(specs: NonNullable<RunResult['specArtifacts']>) {
+  return specs.map((spec) => `# ${spec.title}\n\nPath: ${spec.path}\nKind: ${spec.kind}\n\n${spec.content}`).join('\n\n---\n\n');
 }
 
 function formatCostSummary(summary: NonNullable<RunResult['costSummary']>) {

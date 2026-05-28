@@ -80,6 +80,8 @@ function toolingOrConfigFile(file: GeneratedFile) {
     name === 'package.json' ||
     name === 'pyproject.toml' ||
     name === 'requirements.txt' ||
+    name.endsWith('.sh') ||
+    name.endsWith('.bash') ||
     name === 'readme.md' ||
     name === '.env.example' ||
     name.endsWith('.env.example')
@@ -98,7 +100,18 @@ function candidatesForKind(files: GeneratedFile[], kind: RepairScopeKind, text: 
   if (kind === 'docker') {
     addMatching((file) => {
       const name = fileName(file.path);
-      return name === 'dockerfile' || name === 'containerfile' || /^compose\.ya?ml$/.test(name) || /^docker-compose\.ya?ml$/.test(name);
+      const normalized = lowerPath(file.path);
+      return (
+        name === 'dockerfile' ||
+        name === 'containerfile' ||
+        name.endsWith('.sh') ||
+        name.endsWith('.bash') ||
+        /^compose\.ya?ml$/.test(name) ||
+        /^docker-compose\.ya?ml$/.test(name) ||
+        (/module(?:not)?found|importerror|traceback|uvicorn|entrypoint|startup|flat backend import|package-relative import|nonexistent package import/i.test(text) &&
+          normalized.startsWith('backend/') &&
+          /\.(py|toml|txt)$/i.test(normalized))
+      );
     });
   } else if (kind === 'frontend') {
     addMatching((file) => lowerPath(file.path).startsWith('frontend/') || /\.(tsx?|jsx?|css|scss|html|json)$/i.test(file.path));
@@ -114,7 +127,33 @@ function candidatesForKind(files: GeneratedFile[], kind: RepairScopeKind, text: 
     addMatching((file) => toolingOrConfigFile(file) || /\.(tsx?|jsx?|py|css|json|ya?ml|mjs|cjs|toml|sql|md)$/i.test(file.path));
   }
 
-  return uniq(candidates.map((file) => file.path));
+  const candidatePaths = candidates.map((file) => file.path);
+  if (kind === 'frontend') {
+    for (const match of Array.from(text.matchAll(/\bfrontend\/public\/[a-z0-9_.\-\/]+/gi))) {
+      candidatePaths.push(match[0].replace(/[.,;:)]+$/u, ''));
+    }
+
+    for (const match of Array.from(text.matchAll(/(?:^|[(/"'\s])\/images\/([a-z0-9_.\-\/]+)/gi))) {
+      candidatePaths.push(`frontend/public/images/${match[1].replace(/[.,;:)]+$/u, '')}`);
+    }
+
+    if (/next build|prerender|ENOTFOUND\s+backend|Export encountered errors|server data fetch|API_INTERNAL_URL|http:\/\/backend/i.test(text)) {
+      for (const file of files.filter((file) => {
+        const normalized = lowerPath(file.path);
+        return (
+          normalized.startsWith('frontend/src/app/') ||
+          normalized.startsWith('frontend/src/lib/') ||
+          normalized === 'frontend/package.json' ||
+          normalized === 'frontend/next.config.js' ||
+          normalized === 'frontend/dockerfile'
+        );
+      })) {
+        candidatePaths.push(file.path);
+      }
+    }
+  }
+
+  return uniq(candidatePaths);
 }
 
 function dynamicDirectories(files: GeneratedFile[], candidatePaths: string[]) {
@@ -166,7 +205,11 @@ function validationText(validation: GeneratedExecutionValidationResult) {
 function repairAreas(text: string) {
   const areas = new Set<RepairScopeKind>();
 
-  if (/docker|compose|container|image|build context|failed to solve|service|port|startup|health|readiness|rancher/i.test(text)) {
+  if (/broken image|static image asset|rendered image|naturalWidth=0|frontend\/public\/|\/images\/|image signature|image asset|mime\/extension|content-type/i.test(text)) {
+    areas.add('frontend');
+  }
+
+  if (/docker|compose|container image|build context|failed to solve|service|port|startup|health|readiness|rancher/i.test(text)) {
     areas.add('docker');
   }
 
@@ -174,7 +217,11 @@ function repairAreas(text: string) {
     areas.add('frontend');
   }
 
-  if (/backend\/|server|route|api|traceback|importerror|modulenotfounderror|\.py\b|entrypoint/i.test(text)) {
+  if (
+    /backend\/|server|route|api|traceback|importerror|modulenotfounderror|\.py\b|entrypoint|Ambiguous mapping|Cannot map .* method|BeanCreationException|Application run failed|Error starting ApplicationContext|\.java\b|controller|@(?:Get|Post|Put|Patch|Delete|Request)Mapping/i.test(
+      text
+    )
+  ) {
     areas.add('backend');
   }
 
@@ -194,6 +241,49 @@ function repairAreas(text: string) {
 }
 
 function firstAreaOrUnknown(text: string): RepairScopeKind {
+  if (/Next\.js App Router server data fetch|next build[\s\S]*ENOTFOUND\s+backend|prerender(?:ing)? page|Export encountered errors|fetch failed[\s\S]*hostname:\s*['"]backend['"]/i.test(text)) {
+    return 'frontend';
+  }
+
+  if (
+    /Python flat backend import|ImportError:\s+attempted relative import|ModuleNotFoundError:\s+No module named ['"]backend['"]|package-relative import|nonexistent package import/i.test(text) &&
+    /backend|\.py\b|uvicorn|traceback|docker|compose/i.test(text)
+  ) {
+    return 'docker';
+  }
+
+  if (
+    /imports .+ but no matching generated file|relative import|Path alias import|tsconfig\.json|jsconfig\.json|compilerOptions\.paths|Missing frontend dependency|Generated npm lockfile|package-lock\.json|postcss\.config|tailwind\.config/i.test(
+      text
+    )
+  ) {
+    return 'frontend';
+  }
+
+  if (/broken image|static image asset|rendered image|naturalWidth=0|frontend\/public\/|\/images\/|image signature|image asset|mime\/extension|content-type/i.test(text)) {
+    return 'frontend';
+  }
+
+  if (/\/api\/[^ \n"'`]+.*(?:404|not found)|(?:404|not found).*\/api\/|double-prefixed|double prefix|route contract|backend collection route|backend detail route|\/api\/products\/products|APIRouter|include_router/i.test(text)) {
+    return 'backend';
+  }
+
+  if (
+    /Ambiguous mapping|Cannot map .* method|There is already .* mapped|BeanCreationException|Application run failed|Error starting ApplicationContext|\.java\b|controller|@(?:Get|Post|Put|Patch|Delete|Request)Mapping/i.test(
+      text
+    )
+  ) {
+    return 'backend';
+  }
+
+  if (/browser DOM|hydration|product cards?|detail route|frontend browser|visible route|homepage|page failed|_next\/image/i.test(text)) {
+    return 'frontend';
+  }
+
+  if (/docker|compose|container image|build context|failed to solve|service|port|startup|health|readiness|rancher/i.test(text)) {
+    return 'docker';
+  }
+
   return Array.from(repairAreas(text))[0] ?? 'unknown';
 }
 
@@ -219,8 +309,14 @@ function scopeLabel(kind: RepairScopeKind, prefix: string) {
 
 function scopeInstructions(kind: RepairScopeKind) {
   const generic = 'Use the loaded DEV skill, exact findings/logs, generated project overview, and candidate files to make the smallest useful generated-code repair. Preserve unrelated files and requirement-relevant behavior.';
+  if (kind === 'backend') {
+    return `${generic} For API 404 or route-contract failures, first verify the backend route registration and route prefixes. Expose the exact endpoints consumed by frontend code before changing frontend fallbacks or container files.`;
+  }
+  if (kind === 'frontend') {
+    return `${generic} For unresolved local imports, fix the import path based on the source file depth and generated file tree; for example, frontend/src/app/products/[id]/page.tsx must use ../../../lib/api to reach frontend/src/lib/api.ts, or use a configured @/ alias. For path alias failures, generate valid JSON in frontend/tsconfig.json or frontend/jsconfig.json with compilerOptions.baseUrl and compilerOptions.paths["@/*"], or replace @/ imports with relative imports. For app-router prerender/build failures caused by server fetches to Compose DNS such as http://backend, make the page dynamic with export const dynamic = 'force-dynamic' or export const revalidate = 0, or use fetch(..., { cache: 'no-store' }) and handle backend failures without throwing during next build. For broken rendered images or static asset signature failures, fix the frontend asset references and files together: do not save SVG/XML text with raster extensions, and keep public URLs aligned with files the browser can decode.`;
+  }
   if (kind === 'docker') {
-    return `${generic} If a build/runtime log names application source files, fix those source files instead of only changing container files.`;
+    return `${generic} If a build/runtime log names application source files, fix those source files instead of only changing container files. For Python API startup failures, align Uvicorn module paths and imports with the Docker build context: a flat ./backend context copied into /app should usually start main:app, not backend.main:app, and root Python files in that flat context must use absolute sibling imports such as "from models import Product", not "from .models" or "from backend.models", unless a real backend package is copied into the image. If generated product seed files exist, startup must invoke an idempotent seed/schema path before the service becomes healthy; README-only seed instructions do not satisfy runtime validation. For host-port conflicts, do not ask validation to stop unrelated containers; move generated Compose host bindings and browser API URLs to configurable 55xxx ports such as frontend 55001, backend 55080, and database 55432.`;
   }
   return generic;
 }

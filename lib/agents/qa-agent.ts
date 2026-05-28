@@ -2,8 +2,9 @@ import { runMarkdownSkillAgent } from './base-agent';
 import { formatUXContractForPrompt } from './ux-agent';
 import { formatGeneratedProjectOverview, formatRunHistoryContext } from '@/lib/context/agent-context';
 import { extractJsonObject } from '@/lib/utils/json';
+import { formatSpecArtifactsForPrompt } from '@/lib/specs/project-specs';
 import { z } from 'zod';
-import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, QAReviewOutput, RequirementImage, RunResult, UXContractOutput } from '@/lib/types';
+import type { DevOutput, GeneratedExecutionValidationResult, GeneratedFile, PreparedTechStackOutput, ProjectSpecArtifact, QAReviewOutput, RequirementImage, RunResult, UXContractOutput } from '@/lib/types';
 
 const QAReviewOutputSchema = z.object({
   status: z.enum(['PASS', 'NEEDS_FIX']),
@@ -161,6 +162,7 @@ function buildQaPrompt(input: {
   requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   uxContract?: UXContractOutput | null;
+  specArtifacts?: ProjectSpecArtifact[] | null;
   baOutput: string;
   devOutput: DevOutput;
   existingFiles: GeneratedFile[];
@@ -176,6 +178,10 @@ Return JSON only.
 Apply the QA skill as the source of review behavior, blocking criteria, validation expectations, and report structure.
 The application source only provides context below. Do not infer extra QA policy from this prompt.
 Keep findings, fixInstructions, and report concise. If status is "NEEDS_FIX", address fixInstructions to the DEV agent.
+
+SPEC-DRIVEN CONTRACT:
+Use these artifacts as the stable acceptance contract. Validate generated behavior against requirements, UX, architecture, implementation, and validation specs before passing the run.
+${formatSpecArtifactsForPrompt(input.specArtifacts, input.compact ? 6_000 : 10_000)}
 
 REQUIREMENTS:
 ${truncate(input.requirements, input.compact ? 1_500 : 3_000)}
@@ -218,6 +224,7 @@ export async function runQAAgent(input: {
   requirementImages?: RequirementImage[] | null;
   preparedTechStack?: PreparedTechStackOutput;
   uxContract?: UXContractOutput | null;
+  specArtifacts?: ProjectSpecArtifact[] | null;
   baOutput: string;
   devOutput: DevOutput;
   existingFiles?: GeneratedFile[];
@@ -247,6 +254,7 @@ export async function runQAAgent(input: {
           requirementImages: input.requirementImages,
           preparedTechStack: input.preparedTechStack,
           uxContract: input.uxContract,
+          specArtifacts: input.specArtifacts,
           baOutput: input.baOutput,
           devOutput: input.devOutput,
           existingFiles: input.existingFiles ?? [],

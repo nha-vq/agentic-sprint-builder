@@ -69,6 +69,11 @@ This section is produced by the prepare-tech-stack flow and is the source of tru
 ## API And Routing Conventions
 {{ROUTES}}
 
+### Route Contract Reliability
+- Treat frontend-consumed API paths as executable contracts. Backend DEV must expose the exact collection/detail paths used by frontend helpers and pages.
+- For product-style apps, the deterministic contract is health endpoint, collection API, example detail API, home/list page with seeded cards, and example detail page.
+- Do not double-prefix routers. If a previous run produced a nested path such as `/api/products/products`, repair the backend route registration instead of changing frontend fallbacks.
+
 ## Component And Source Conventions
 {{CONVENTIONS}}
 
@@ -117,9 +122,14 @@ These lessons are accumulated from previous Code Review, DevOps, static validati
 
 ## Recurring Build Lessons
 - In App Router projects, components importing client-only UI libraries such as `react-icons`, using hooks, browser APIs, event handlers, or client navigation must begin with `'use client';`.
+- App Router Server Components that fetch backend data during `next build` must not prerender against Compose-only DNS such as `http://backend`; use dynamic rendering, `revalidate = 0`, or no-store fetches with build-safe error handling.
 - Do not import `next/document` from `app/` files or shared components.
 - Dockerfile `COPY --from=builder` sources must exist in the builder output. Do not copy `/app/public` unless the generated frontend includes a `public/` directory/file.
+- Do not run `npm ci` in a generated Dockerfile unless the same generated service directory includes a matching `package-lock.json` or `npm-shrinkwrap.json`. Because generated projects normally omit lockfiles, prefer `COPY package*.json ./` plus `npm install`.
+- Flat `./backend` Docker contexts copied into `/app` must start FastAPI with `uvicorn main:app`, not `uvicorn backend.main:app`, unless the generated image contains an actual `/app/backend/` package. Flat root Python files must use absolute sibling imports such as `from models import Product`, not `from .models` or `from backend.models`.
+- Generated product seed files must be invoked by backend startup before health-dependent frontend startup. Idempotent startup seeding is acceptable; README-only seed instructions are not a runtime startup path.
 - Browser-facing API URLs must be reachable from the user's browser; Compose-only service DNS such as `http://backend:8000` is not valid for client-side code unless a browser-reachable proxy is generated.
+- API route prefix composition must be checked before container validation. A healthy backend with 404 product APIs is not deploy-ready.
 
 ## Future Feature Rules
 - Load this skill before planning future DEV work for this project.

@@ -86,6 +86,7 @@ export default async function RunOutputPage({ params }: { params: { runId: strin
 
         <Artifact title="BA Artifacts" content={result.baOutput} />
         {result.uxContract ? <Artifact title="UX Contract" content={JSON.stringify(result.uxContract, null, 2)} /> : null}
+        {result.specArtifacts?.length ? <Artifact title="Spec-Driven Contracts" content={formatSpecArtifacts(result.specArtifacts)} /> : null}
         {result.agentModels ? <Artifact title="Agent Models" content={formatAgentModels(result.agentModels)} /> : null}
         {result.costSummary ? <Artifact title="AI Cost" content={formatCostSummary(result.costSummary)} /> : null}
         {result.costControlNotes?.length ? <Artifact title="Cost Controls" content={result.costControlNotes.map((note) => `- ${note}`).join('\n')} /> : null}
@@ -182,6 +183,10 @@ function formatAgentModels(models: NonNullable<NonNullable<Awaited<ReturnType<ty
   return Object.entries(models)
     .map(([agentId, model]) => `- ${agentId}: ${model}`)
     .join('\n');
+}
+
+function formatSpecArtifacts(specs: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['specArtifacts']>) {
+  return specs.map((spec) => `# ${spec.title}\n\nPath: ${spec.path}\nKind: ${spec.kind}\n\n${spec.content}`).join('\n\n---\n\n');
 }
 
 function formatCostSummary(summary: NonNullable<NonNullable<Awaited<ReturnType<typeof readRunResult>>>['costSummary']>) {

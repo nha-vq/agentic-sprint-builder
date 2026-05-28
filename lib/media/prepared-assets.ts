@@ -174,7 +174,7 @@ export async function writePreparedMediaAssets(files: PreparedMediaAssetFile[]) 
 
 export function formatPreparedMediaAssetsForPrompt(assets?: PreparedMediaAsset[] | null) {
   if (!assets?.length) {
-    return 'No local prepared media assets were downloaded. Do not use generic placeholder image services; use CSS treatment or relevant licensed URLs from BA/UX only.';
+    return 'No local prepared media assets were downloaded. Do not use generic placeholder image services or empty CSS boxes as completed product imagery. If the UI requires product/hero/detail media, surface the missing asset blocker clearly and use only relevant licensed URLs from BA/UX when available.';
   }
 
   return `Prepared local media assets are available and will be written into the generated app. Use these public URLs in frontend code and seed data instead of remote placeholder services.

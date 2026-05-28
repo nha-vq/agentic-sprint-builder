@@ -55,7 +55,7 @@ export interface FreeImageCandidate {
   thumbUrl?: string;
   license: string;
   licenseUrl?: string;
-  source: 'Wikimedia Commons';
+  source: 'Wikimedia Commons' | 'Openverse';
   query: string;
 }
 
@@ -153,6 +153,15 @@ export interface RunStatusSnapshot {
 }
 
 export interface GeneratedFile {
+  path: string;
+  content: string;
+}
+
+export type ProjectSpecKind = 'requirements' | 'ux' | 'architecture' | 'implementation' | 'validation';
+
+export interface ProjectSpecArtifact {
+  kind: ProjectSpecKind;
+  title: string;
   path: string;
   content: string;
 }
@@ -325,6 +334,7 @@ export interface RunResult {
   costBudgetUsd?: number;
   costBudgetExceeded?: boolean;
   costControlNotes?: string[];
+  specArtifacts?: ProjectSpecArtifact[];
   observationReportPath?: string;
   observationReportUrl?: string;
   visualComparison?: VisualComparisonResult;

@@ -23,6 +23,9 @@ You are the Frontend DEV Agent. You implement only frontend-owned files assigned
 - Server components may render static markup and fetch server-safe data, but they must not use client-only libraries.
 - Keep shared chrome such as Header, Footer, ProductCard, filters, drawers, and icon buttons either server-safe or explicitly client components.
 - Ensure `next build` and production `next start` can render `/`, `/_not-found`, and dynamic routes without event-handler, `useContext`, hook, or browser API crashes.
+- App Router Server Components that fetch backend data during `next build` must not prerender against Compose-only DNS such as `http://backend`. If a page imports backend API helpers, mark it dynamic with `export const dynamic = 'force-dynamic'` or `export const revalidate = 0`, or make the fetch use `{ cache: 'no-store' }` and handle backend failures without throwing during build.
+- Do not use imports such as `@/components/...` or `@/types/...` unless the generated frontend also includes `tsconfig.json` or `jsconfig.json` with `compilerOptions.baseUrl` and `compilerOptions.paths["@/*"]` mapped to the actual source root. Prefer relative imports for small generated apps.
+- If frontend config or source references Tailwind, PostCSS, or `autoprefixer`, declare the matching package in the frontend `package.json`; a config reference without a dependency is a build blocker.
 
 ## Visual And Asset Rules
 
@@ -37,13 +40,14 @@ You are the Frontend DEV Agent. You implement only frontend-owned files assigned
 
 ## Frontend/Backend Runtime Rules
 
-- Public browser variables such as `NEXT_PUBLIC_API_URL` or `VITE_API_URL` must be browser-reachable, usually `http://127.0.0.1:8000` or `http://localhost:8000`.
+- Public browser variables such as `NEXT_PUBLIC_API_URL` or `VITE_API_URL` must be browser-reachable, usually `http://127.0.0.1:55080` or `http://localhost:55080` for generated Compose apps.
 - Server-side frontend code running inside Docker must not call `localhost` to reach the backend container. Use an internal variable such as `API_INTERNAL_URL=http://backend:8000` for server components, server functions, loaders, or SSR data helpers.
 - API helpers used by both server and client must choose the base URL by execution context. Do not bake a browser-only URL into server-rendered data fetches.
+- If a page imports a named symbol from `src/lib/api.ts`, that module must export the exact symbol. Prefer exporting `fetchProducts` and `fetchProductById` helpers that call `/api/products` and `/api/products/{id}` against the correct server/client base URL.
 - Before returning frontend files, check that the home/list page renders real seeded data, generated detail routes such as `/products/1` return content instead of 404, and visible images do not show broken placeholders.
 
 ## Output Rules
 
 - Return exactly the requested JSON or raw-marker output shape from the runtime prompt.
 - Do not add files outside the assigned paths.
-- Do not include secrets, lockfiles, build output, binary/base64 assets, screenshots, or vendored dependencies.
+- Do not include secrets, lockfiles, build output, binary/base64 assets, screenshots, or vendored dependencies. Never generate empty or placeholder `package-lock.json`; remove it and coordinate with Integration DEV to use `npm install` unless a complete lockfile is explicitly required.

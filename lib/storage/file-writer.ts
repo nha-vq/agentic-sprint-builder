@@ -73,6 +73,8 @@ const TEXT_FILE_EXTENSIONS = new Set([
   '.md',
   '.mjs',
   '.py',
+  '.bash',
+  '.sh',
   '.ts',
   '.tsx',
   '.txt',
@@ -166,6 +168,14 @@ export async function saveRunResult(result: RunResult) {
   const resultWithOutputDir = { ...result, outputDir };
 
   await fs.mkdir(outputDir, { recursive: true });
+  if (result.specArtifacts?.length) {
+    for (const artifact of result.specArtifacts) {
+      const specPath = artifact.path.startsWith('specs/') ? artifact.path : `specs/${path.basename(artifact.path)}`;
+      const destination = resolveGeneratedFilePath(outputDir, specPath);
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.writeFile(destination, artifact.content, 'utf-8');
+    }
+  }
   await fs.writeFile(path.join(outputDir, 'run-result.json'), JSON.stringify(resultWithOutputDir, null, 2));
   await fs.writeFile(path.join(outputDir, 'BA_ARTIFACTS.md'), result.baOutput);
   await fs.writeFile(path.join(outputDir, 'QA_REPORT.md'), result.qaOutput);

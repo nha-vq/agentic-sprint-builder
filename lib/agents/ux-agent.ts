@@ -124,7 +124,7 @@ export function createDegradedUXContract(input: {
   const hasMockups = (input.requirementImages?.length ?? 0) > 0;
   const imageCandidateNote = input.freeImageCandidates?.length
     ? `Use only relevant free/safe candidates from BA media planning; reject candidates that do not match the mockup subject, crop, and tone.`
-    : `Use local/public placeholders or CSS treatments that preserve the mockup aspect ratios; do not hotlink unsafe or unrelated images.`;
+    : `Treat missing licensed media as a visual asset blocker for product cards, hero media, galleries, and detail pages. Preserve image-slot aspect ratios, but do not present empty placeholders as completed product imagery.`;
 
   return {
     summary: `Degraded UX contract generated because UX model call failed: ${input.reason}. DEV must use BA visual contract, requirements, and attached mockups (${imageNames}) as the source of truth.`,

@@ -149,6 +149,7 @@ PACKAGE MANIFESTS:
 ${packageManifests || 'No package manifests found'}
 
 Validate: Docker Compose configuration, Dockerfile correctness, Dockerfile COPY sources against the generated file tree, port mappings, environment variables, healthchecks, startup commands, volume mounts, frontend build readiness signals, and overall deployment readiness.
+Treat Dockerfile optimization, redundant layer/COPY ordering, image-size suggestions, and generic best practices as advisory unless they can concretely break image build, service startup, healthchecks, browser runtime, or security.
 Return JSON only.
 `
   });

@@ -262,10 +262,16 @@ function scoreVisualComparison(params: {
     findings.push('Execution validation did not pass.');
   }
 
-  if (/unable to load|failed to fetch|cors|net::err|browser dom did not show|runtime javascript error/i.test(evidence)) {
+  const hasBrokenImageEvidence = /"brokenImages"\s*:\s*\[\s*\{|naturalWidth"\s*:\s*0/i.test(evidence);
+  if (hasBrokenImageEvidence) {
+    findings.push('Browser evidence contains broken rendered images.');
+    recommendations.push('Fix missing or corrupt image assets before judging final visual fidelity.');
+  }
+
+  if (/unable to load|failed to fetch|cors|net::err_(?!aborted)\w+|browser dom did not show|runtime javascript error/i.test(evidence)) {
     findings.push('Browser evidence contains runtime/data loading failure text.');
     recommendations.push('Fix browser-visible data loading before judging final visual fidelity.');
-  } else {
+  } else if (!hasBrokenImageEvidence) {
     score += 15;
   }
 

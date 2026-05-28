@@ -55,7 +55,7 @@ backend/
 - Used by Docker healthcheck and monitoring
 
 ### CORS Configuration
-- Allow frontend origins (localhost:3000, localhost:3001)
+- Allow frontend origins for generated Compose (`localhost:55001`, `127.0.0.1:55001`) and local dev (`localhost:3000`, `127.0.0.1:3000`)
 - Allow required HTTP methods
 - Allow required headers
 - Configurable via environment variables

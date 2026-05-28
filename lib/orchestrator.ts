@@ -16,20 +16,21 @@ import { runPrepareTechStackAgent } from '@/lib/agents/tech-stack-agent';
 import { runUXAgent } from '@/lib/agents/ux-agent';
 import { formatGeneratedProjectOverview } from '@/lib/context/agent-context';
 import { listRunResults, readGeneratedCodeSnapshot, saveRunResult, writeGeneratedFiles } from '@/lib/storage/file-writer';
-import { validateGeneratedProject, type GeneratedProjectValidation } from '@/lib/validation/generated-project';
+import { deterministicStaticBlockerFindings, validateGeneratedProject, type GeneratedProjectValidation } from '@/lib/validation/generated-project';
 import { prewarmGeneratedComposeRuntime, validateGeneratedProjectExecution } from '@/lib/validation/generated-execution';
 import { formatRepairScope, inferQaRepairScope, inferReviewRepairScope, inferStaticRepairScope } from '@/lib/validation/repair-scope';
-import { validateBaOutputStructure, validatePreparedTechStackStructure } from '@/lib/validation/agent-lifecycle';
+import { validateBaOutputStructure, validatePreparedTechStackAlignment, validatePreparedTechStackStructure } from '@/lib/validation/agent-lifecycle';
 import { DEFAULT_PROJECT_ID, loadProjectDevSkill, writeProjectDevSkill, writePreDevProjectSkill, type ProjectDevSkill } from '@/lib/skills/project-dev-skill';
 import { enrichSkillContext } from '@/lib/skills/skill-enrichment';
 import { searchFreeSafeImages } from '@/lib/media/free-image-search';
 import { prepareMediaAssets, writePreparedMediaAssets, type PreparedMediaAssetFile } from '@/lib/media/prepared-assets';
 import { generateObservationReport } from '@/lib/reports/observation-report';
+import { buildFinalSpecArtifacts, buildPreDevSpecArtifacts } from '@/lib/specs/project-specs';
 import { agentModelFor } from '@/lib/agent-models';
 import { runWithLlmUsageTracking, summarizeLlmUsage } from '@/lib/llm/usage-tracker';
 import fs from 'fs/promises';
 import path from 'path';
-import type { AgentEvent, DevOutput, GeneratedExecutionValidationResult, GeneratedFile, LlmUsageRecord, PreparedMediaAsset, PreparedTechStackOutput, QAReviewOutput, RepairScope, RunProgressReporter, RunRequest, RunResult, UXContractOutput } from '@/lib/types';
+import type { AgentEvent, DevOutput, GeneratedExecutionValidationResult, GeneratedFile, LlmUsageRecord, PreparedMediaAsset, PreparedTechStackOutput, ProjectSpecArtifact, QAReviewOutput, RepairScope, RunProgressReporter, RunRequest, RunResult, UXContractOutput } from '@/lib/types';
 
 function readPositiveIntegerEnv(name: string, fallback: number) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
@@ -47,13 +48,14 @@ function readNonNegativeNumberEnv(name: string, fallback: number) {
 const MAX_CODE_REVIEW_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_CODE_REVIEW_FIX_ITERATIONS', 2);
 const MAX_DEPLOY_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_DEPLOY_FIX_ITERATIONS', 2);
 const MAX_QA_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_QA_FIX_ITERATIONS', 1);
+const MAX_TECH_STACK_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_TECH_STACK_FIX_ITERATIONS', 1);
 const MAX_BUILD_READINESS_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_BUILD_READINESS_FIX_ITERATIONS', 2);
 const MAX_EXECUTION_VALIDATION_FIX_ITERATIONS = readPositiveIntegerEnv('MAX_EXECUTION_VALIDATION_FIX_ITERATIONS', 3);
 const MAX_REPAIR_LOG_CHARS = readPositiveIntegerEnv('MAX_REPAIR_LOG_CHARS', 8_000);
 const MAX_REPAIR_TOTAL_LOG_CHARS = readPositiveIntegerEnv('MAX_REPAIR_TOTAL_LOG_CHARS', 20_000);
 const MAX_REPAIR_TREE_FILES = readPositiveIntegerEnv('MAX_REPAIR_TREE_FILES', 120);
-const RUN_COST_BUDGET_USD = readNonNegativeNumberEnv('RUN_COST_BUDGET_USD', 6);
-const RUN_COST_WARN_USD = readNonNegativeNumberEnv('RUN_COST_WARN_USD', 4);
+const RUN_COST_BUDGET_USD = readNonNegativeNumberEnv('RUN_COST_BUDGET_USD', 10);
+const RUN_COST_WARN_USD = readNonNegativeNumberEnv('RUN_COST_WARN_USD', 7);
 
 function shouldRunFullQaAgent(validation?: GeneratedExecutionValidationResult) {
   const raw = (process.env.RUN_FULL_QA_AGENT || 'auto').trim().toLowerCase();
@@ -446,6 +448,66 @@ function createPassingDeployValidation(summary: string): DeployOutput {
   };
 }
 
+function createStaticBlockedCodeReview(findings: string[]): CodeReviewOutput {
+  return {
+    status: 'NEEDS_FIX',
+    blocking: findings.slice(0, 12).map((finding) => ({
+      category: 'static-readiness',
+      file: 'generated-code',
+      finding,
+      fix: 'Fix the deterministic static readiness blocker before running paid model review.'
+    })),
+    advisory: [],
+    summary: `Skipped paid CodeReview because deterministic static readiness still has ${findings.length} blocker(s).`,
+    requirementCoverage: 'Blocked before model review by deterministic static validation.'
+  };
+}
+
+function createStaticBlockedDeployValidation(findings: string[]): DeployOutput {
+  return {
+    status: 'NEEDS_FIX',
+    blocking: findings.slice(0, 12).map((finding) => ({
+      category: 'static-readiness',
+      file: 'generated-code',
+      finding,
+      fix: 'Fix the deterministic static readiness blocker before running paid deployment review.'
+    })),
+    advisory: [],
+    deployCommand: 'not run',
+    services: [],
+    summary: `Skipped paid DevOps review because deterministic static readiness still has ${findings.length} blocker(s).`
+  };
+}
+
+function createStaticBlockedExecutionValidation(params: {
+  validation: GeneratedProjectValidation;
+  blockers: string[];
+  workspace: string;
+  repairScope?: RepairScope;
+}): GeneratedExecutionValidationResult {
+  const timestamp = new Date().toISOString();
+  return {
+    status: 'NEEDS_FIX',
+    startedAt: timestamp,
+    finishedAt: timestamp,
+    workspace: params.workspace,
+    findings: params.blockers,
+    fixInstructions: params.validation.fixInstructions,
+    repairScope: params.repairScope,
+    steps: [
+      {
+        name: 'static readiness gate',
+        status: 'FAIL',
+        command: 'validateGeneratedProject',
+        message: [
+          'Skipped Docker/browser execution because deterministic static readiness blockers remained after bounded DEV repair attempts.',
+          ...params.blockers.map((finding) => `- ${finding}`)
+        ].join('\n')
+      }
+    ]
+  };
+}
+
 export async function runSprintBuilder(input: RunRequest, options?: { runId?: string; onProgress?: RunProgressReporter; signal?: AbortSignal }): Promise<RunResult> {
   const llmUsageRecords: LlmUsageRecord[] = [];
   return runWithLlmUsageTracking(llmUsageRecords, () => runSprintBuilderTracked(input, options, llmUsageRecords));
@@ -638,7 +700,7 @@ async function runSprintBuilderTracked(
   }
 
   await progress({ stepId: 'ba', stepStatus: 'RUNNING', message: 'BA agent is analyzing requirements.' });
-  await progress({ stepId: 'ba', stepStatus: 'RUNNING', level: 'info', message: 'Searching Wikimedia Commons for free/safe image candidates for BA visual planning.' });
+  await progress({ stepId: 'ba', stepStatus: 'RUNNING', level: 'info', message: 'Searching licensed image providers for free/safe media candidates for BA visual planning.' });
   const freeImageCandidates = await searchFreeSafeImages({
     requirements: input.requirements,
     techSpec: input.techSpec,
@@ -652,7 +714,7 @@ async function runSprintBuilderTracked(
     message:
       freeImageCandidates.length > 0
         ? `Found ${freeImageCandidates.length} free/safe image candidate(s) for BA and DEV.`
-        : 'No free/safe image candidates found; BA and DEV will continue without remote imagery links.'
+        : 'No free/safe image candidates found; image-heavy product UIs must surface this as a media blocker or use later prepared local assets, not completed placeholder imagery.'
   });
   let preparedMediaAssets: PreparedMediaAsset[] = [];
   let preparedMediaAssetFiles: PreparedMediaAssetFile[] = [];
@@ -668,7 +730,7 @@ async function runSprintBuilderTracked(
       message:
         preparedMediaAssets.length > 0
           ? `Prepared ${preparedMediaAssets.length} local media asset(s) for generated frontend public assets.`
-          : 'Could not download local media assets from image candidates; DEV must avoid generic placeholders and use only relevant licensed URLs or CSS treatments.'
+          : 'Could not download local media assets from image candidates; DEV must avoid generic placeholders and surface missing product/hero media as a blocker unless relevant licensed URLs are still usable.'
     });
   }
   await emit({ agentId: 'ba', eventType: 'THINKING', task: 'Analyze requirements and scope', artifact: 'BA_ARTIFACTS.md' });
@@ -698,7 +760,7 @@ async function runSprintBuilderTracked(
 
   await progress({ stepId: 'tech-stack', stepStatus: 'RUNNING', message: 'Running prepare-tech-stack from BA output.' });
   await emit({ agentId: 'tech-stack', eventType: 'THINKING', task: 'Prepare technology stack from BA output', artifact: 'PREPARED_TECH_STACK.json' });
-  const preparedTechStack: PreparedTechStackOutput = await runPrepareTechStackAgent({
+  let preparedTechStack: PreparedTechStackOutput = await runPrepareTechStackAgent({
     requirements: input.requirements,
     techSpec: input.techSpec,
     baOutput,
@@ -708,21 +770,56 @@ async function runSprintBuilderTracked(
     signal: options?.signal
   });
   throwIfCanceled(options?.signal);
-  const preparedTechStackValidation = validatePreparedTechStackStructure(preparedTechStack);
-  if (preparedTechStackValidation.status !== 'PASS') {
+  let preparedTechStackValidation = validatePreparedTechStackStructure(preparedTechStack);
+  let preparedTechStackAlignment = validatePreparedTechStackAlignment(input.techSpec, preparedTechStack);
+  let preparedTechStackFindings = [...preparedTechStackValidation.findings, ...preparedTechStackAlignment.findings];
+  let techStackFixIterations = 0;
+
+  while (preparedTechStackFindings.length > 0 && techStackFixIterations < MAX_TECH_STACK_FIX_ITERATIONS) {
+    techStackFixIterations += 1;
+    const validationFeedback = preparedTechStackFindings.map((finding) => `- ${finding}`).join('\n');
+    await progress({
+      stepId: 'tech-stack',
+      stepStatus: 'RUNNING',
+      level: 'warn',
+      message: `prepare-tech-stack output did not satisfy explicit stack contract; retrying TA once before DEV generation. Findings:\n${validationFeedback}`
+    });
+    await emit({
+      agentId: 'tech-stack',
+      eventType: 'THINKING',
+      task: `Repair prepared tech stack contract iteration ${techStackFixIterations}`,
+      artifact: 'PREPARED_TECH_STACK.json'
+    });
+    preparedTechStack = await runPrepareTechStackAgent({
+      requirements: input.requirements,
+      techSpec: input.techSpec,
+      baOutput,
+      existingFiles,
+      recentRuns,
+      validationFeedback,
+      modelOverride: selectedAgentModels['tech-stack'],
+      signal: options?.signal
+    });
+    throwIfCanceled(options?.signal);
+    preparedTechStackValidation = validatePreparedTechStackStructure(preparedTechStack);
+    preparedTechStackAlignment = validatePreparedTechStackAlignment(input.techSpec, preparedTechStack);
+    preparedTechStackFindings = [...preparedTechStackValidation.findings, ...preparedTechStackAlignment.findings];
+  }
+
+  if (preparedTechStackFindings.length > 0) {
     await progress({
       stepId: 'tech-stack',
       stepStatus: 'FAIL',
       level: 'error',
-      message: `prepare-tech-stack output is incomplete: ${preparedTechStackValidation.findings.join('; ')}`
+      message: `prepare-tech-stack output does not satisfy the explicit stack contract: ${preparedTechStackFindings.join('; ')}`
     });
-    throw new Error(`prepare-tech-stack output is incomplete: ${preparedTechStackValidation.findings.join('; ')}`);
+    throw new Error(`prepare-tech-stack output does not satisfy the explicit stack contract: ${preparedTechStackFindings.join('; ')}`);
   }
   await progress({
     stepId: 'tech-stack',
     stepStatus: 'PASS',
     level: 'success',
-    message: `prepare-tech-stack completed: ${preparedTechStack.frontendFramework}, ${preparedTechStack.backendFramework}, ${preparedTechStack.database}.`
+    message: `prepare-tech-stack completed after ${techStackFixIterations} contract repair attempt(s): ${preparedTechStack.frontendFramework}, ${preparedTechStack.backendFramework}, ${preparedTechStack.database}.`
   });
   await emit({ agentId: 'tech-stack', eventType: 'WORK_COMPLETE', task: 'Prepared tech stack completed', toAgent: 'ux', artifact: 'PREPARED_TECH_STACK.json' });
 
@@ -755,6 +852,23 @@ async function runSprintBuilderTracked(
     task: uxDegraded ? 'UX model failed; degraded UX/UI contract generated from BA output and mockups' : 'UX/UI contract completed; handing stable design rules to TA and DEV',
     toAgent: 'tech-stack',
     artifact: 'UX_CONTRACT.json'
+  });
+
+  let specArtifacts: ProjectSpecArtifact[] = buildPreDevSpecArtifacts({
+    requirements: input.requirements,
+    techSpec: input.techSpec,
+    baOutput,
+    preparedTechStack,
+    uxContract,
+    requirementImages: input.requirementImages,
+    freeImageCandidates,
+    preparedMediaAssets
+  });
+  await progress({
+    stepId: 'tech-stack',
+    stepStatus: 'RUNNING',
+    level: 'success',
+    message: `Spec-driven contract prepared with ${specArtifacts.length} artifact(s) for DEV and QA.`
   });
 
   await progress({ stepId: 'tech-stack', level: 'info', message: 'Enriching generic skill templates with tech stack decisions.' });
@@ -851,6 +965,7 @@ async function runSprintBuilderTracked(
     modelOverride: selectedAgentModels.dev,
     agentModelOverrides: selectedAgentModels,
     preparedTechStack,
+    specArtifacts,
     baOutput,
     existingFiles,
     recentRuns,
@@ -870,6 +985,105 @@ async function runSprintBuilderTracked(
     devOutput,
     reason: projectDevSkill ? 'Update TA DEV context after DEV generation.' : 'Create TA DEV context after first generated-code scaffold.'
   });
+
+  let buildReadinessFixIterations = 0;
+  let preReviewStaticFindingsStalled = false;
+  let preReviewStaticRepairStoppedForCost = false;
+  await progress({ stepId: 'static-validation', stepStatus: 'RUNNING', message: 'Running pre-review static contract validation gate.' });
+  let buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
+  await reportStaticReadiness(options?.onProgress, buildReadiness, 'Pre-review static contract validation gate');
+  while (buildReadiness.status === 'NEEDS_FIX' && buildReadinessFixIterations < MAX_BUILD_READINESS_FIX_ITERATIONS) {
+    if (await stopForCostBudget('pre-review static contract repair iteration')) {
+      preReviewStaticRepairStoppedForCost = true;
+      break;
+    }
+    const previousStaticSignature = staticFindingsSignature(buildReadiness);
+    buildReadinessFixIterations += 1;
+
+    await emit({
+      agentId: 'deploy',
+      eventType: 'REVIEW_REQUEST',
+      task: `Static contract gate found blockers; sending targeted fix request ${buildReadinessFixIterations} to DEV before CodeReview`,
+      toAgent: 'dev',
+      artifact: 'generated-files'
+    });
+
+    existingFiles = await readGeneratedCodeSnapshot();
+    const repairScope = inferStaticRepairScope(buildReadiness, existingFiles);
+    await reportRepairScope(options?.onProgress, repairScope);
+    await emit({ agentId: 'dev', eventType: 'CODING', task: `Fix static contract blockers iteration ${buildReadinessFixIterations}`, artifact: 'generated-files' });
+    devOutput = await runDevAgent({
+      requirements: input.requirements,
+      techSpec: input.techSpec,
+      requirementImages: input.requirementImages,
+      freeImageCandidates,
+      preparedMediaAssets,
+      uxContract,
+      modelOverride: selectedAgentModels.dev,
+      agentModelOverrides: selectedAgentModels,
+      preparedTechStack,
+      specArtifacts,
+      baOutput,
+      existingFiles,
+      recentRuns,
+      previousDevOutput: devOutput,
+      qaFeedback: buildReadiness.fixInstructions,
+      repairScope,
+      apiSpec: input.apiSpec,
+      projectDevSkill,
+      enrichedSkillContext: enrichedSkill.combined,
+      onProgress: progress,
+      onAgentActivity: emit,
+      signal: options?.signal
+    });
+    throwIfCanceled(options?.signal);
+    writeResult = await writeAndRefreshDevOutput(devOutput, preparedMediaAssetFiles);
+    devOutput = writeResult.devOutput;
+    codeOutputDir = writeResult.codeOutputDir;
+    projectDevSkill = await updateProjectSkillFromDevOutput({
+      devOutput,
+      learningNotes: staticValidationLearningNotes(buildReadiness),
+      reason: `Static contract gate repair iteration ${buildReadinessFixIterations}.`
+    });
+    await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: `Static contract fixes generated iteration ${buildReadinessFixIterations}`, toAgent: 'code-review', artifact: 'generated-files' });
+
+    await progress({
+      stepId: 'static-validation',
+      stepStatus: 'RUNNING',
+      message: `Re-running pre-review static contract validation after DEV fix iteration ${buildReadinessFixIterations}.`
+    });
+    buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
+    await reportStaticReadiness(options?.onProgress, buildReadiness, `Pre-review static contract validation after DEV fix ${buildReadinessFixIterations}`);
+    await reportCostCheckpoint(`pre-review static contract repair iteration ${buildReadinessFixIterations}`);
+
+    if (buildReadiness.status === 'NEEDS_FIX' && staticFindingsSignature(buildReadiness) === previousStaticSignature) {
+      preReviewStaticFindingsStalled = true;
+      await progress({
+        stepId: 'static-validation',
+        stepStatus: 'FAIL',
+        level: 'warn',
+        message: 'Pre-review static contract findings did not change after the last DEV repair; stopping early repair loop and keeping deterministic blockers as the next gate.'
+      });
+      break;
+    }
+  }
+
+  let staticBlockersBeforePaidValidation = deterministicStaticBlockerFindings(buildReadiness);
+  const skipPaidValidationForStaticBlockers =
+    buildReadiness.status === 'NEEDS_FIX' &&
+    staticBlockersBeforePaidValidation.length > 0 &&
+    (preReviewStaticFindingsStalled || preReviewStaticRepairStoppedForCost || buildReadinessFixIterations >= MAX_BUILD_READINESS_FIX_ITERATIONS);
+  if (skipPaidValidationForStaticBlockers) {
+    const note = `Skipped paid CodeReview/DevOps validation and execution repair because ${staticBlockersBeforePaidValidation.length} deterministic static blocker(s) remained after ${buildReadinessFixIterations}/${MAX_BUILD_READINESS_FIX_ITERATIONS} static repair attempt(s).`;
+    recordCostControlNote(note);
+    await progress({
+      stepId: 'static-validation',
+      stepStatus: 'FAIL',
+      level: 'warn',
+      message: `${note}\n${staticBlockersBeforePaidValidation.slice(0, 4).map((finding) => `- ${finding}`).join('\n')}`
+    });
+  }
+
   await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: 'Implementation files generated', toAgent: 'code-review', artifact: 'generated-files' });
 
   async function runCodeReviewStep(label: string) {
@@ -898,15 +1112,33 @@ async function runSprintBuilderTracked(
 
   let codeReview: CodeReviewOutput;
   let codeReviewFixIterations = 0;
-  try {
-    codeReview = await runCodeReviewStep('CodeReviewAgent is reviewing generated code.');
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await progress({ stepId: 'code-review', stepStatus: 'SKIPPED', level: 'warn', message: `Code review skipped: ${message}` });
-    codeReview = createPassingCodeReview('Skipped due to error');
+  if (skipPaidValidationForStaticBlockers) {
+    codeReview = createStaticBlockedCodeReview(staticBlockersBeforePaidValidation);
+    await progress({
+      stepId: 'code-review',
+      stepStatus: 'SKIPPED',
+      level: 'warn',
+      message: codeReview.summary
+    });
+  } else if (await stopForCostBudget('initial CodeReview model review')) {
+    codeReview = createPassingCodeReview('Skipped initial CodeReview model review because the run cost budget was reached.');
+    await progress({
+      stepId: 'code-review',
+      stepStatus: 'SKIPPED',
+      level: 'warn',
+      message: codeReview.summary
+    });
+  } else {
+    try {
+      codeReview = await runCodeReviewStep('CodeReviewAgent is reviewing generated code.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await progress({ stepId: 'code-review', stepStatus: 'SKIPPED', level: 'warn', message: `Code review skipped: ${message}` });
+      codeReview = createPassingCodeReview('Skipped due to error');
+    }
   }
 
-  while (codeReview.status === 'NEEDS_FIX' && codeReviewFixIterations < MAX_CODE_REVIEW_FIX_ITERATIONS) {
+  while (codeReview.status === 'NEEDS_FIX' && !skipPaidValidationForStaticBlockers && codeReviewFixIterations < MAX_CODE_REVIEW_FIX_ITERATIONS) {
     if (await stopForCostBudget('CodeReview repair iteration')) break;
     codeReviewFixIterations += 1;
     await emit({
@@ -943,6 +1175,7 @@ async function runSprintBuilderTracked(
       modelOverride: selectedAgentModels.dev,
       agentModelOverrides: selectedAgentModels,
       preparedTechStack,
+      specArtifacts,
       baOutput,
       existingFiles,
       recentRuns,
@@ -1012,15 +1245,33 @@ async function runSprintBuilderTracked(
 
   let deployValidation: DeployOutput;
   let deployFixIterations = 0;
-  try {
-    deployValidation = await runDeployReviewStep('DevOps agent is validating container and deployment readiness.');
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await progress({ stepId: 'deploy-validation', stepStatus: 'SKIPPED', level: 'warn', message: `Deploy validation skipped: ${message}` });
-    deployValidation = createPassingDeployValidation('Skipped due to error');
+  if (skipPaidValidationForStaticBlockers) {
+    deployValidation = createStaticBlockedDeployValidation(staticBlockersBeforePaidValidation);
+    await progress({
+      stepId: 'deploy-validation',
+      stepStatus: 'SKIPPED',
+      level: 'warn',
+      message: deployValidation.summary
+    });
+  } else if (await stopForCostBudget('initial DevOps model review')) {
+    deployValidation = createPassingDeployValidation('Skipped initial DevOps model review because the run cost budget was reached.');
+    await progress({
+      stepId: 'deploy-validation',
+      stepStatus: 'SKIPPED',
+      level: 'warn',
+      message: deployValidation.summary
+    });
+  } else {
+    try {
+      deployValidation = await runDeployReviewStep('DevOps agent is validating container and deployment readiness.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await progress({ stepId: 'deploy-validation', stepStatus: 'SKIPPED', level: 'warn', message: `Deploy validation skipped: ${message}` });
+      deployValidation = createPassingDeployValidation('Skipped due to error');
+    }
   }
 
-  while (deployValidation.status === 'NEEDS_FIX' && deployFixIterations < MAX_DEPLOY_FIX_ITERATIONS) {
+  while (deployValidation.status === 'NEEDS_FIX' && !skipPaidValidationForStaticBlockers && deployFixIterations < MAX_DEPLOY_FIX_ITERATIONS) {
     if (await stopForCostBudget('DevOps repair iteration')) break;
     deployFixIterations += 1;
     await emit({
@@ -1062,6 +1313,7 @@ async function runSprintBuilderTracked(
       modelOverride: selectedAgentModels.dev,
       agentModelOverrides: selectedAgentModels,
       preparedTechStack,
+      specArtifacts,
       baOutput,
       existingFiles,
       recentRuns,
@@ -1108,11 +1360,10 @@ async function runSprintBuilderTracked(
     artifact: 'DEPLOY_VALIDATION.json'
   });
 
-  let buildReadinessFixIterations = 0;
-  await progress({ stepId: 'static-validation', stepStatus: 'RUNNING', message: 'Running static readiness check.' });
-  let buildReadiness = validateGeneratedProject(devOutput);
-  await reportStaticReadiness(options?.onProgress, buildReadiness, 'Static readiness check');
-  while (buildReadiness.status === 'NEEDS_FIX' && buildReadinessFixIterations < MAX_BUILD_READINESS_FIX_ITERATIONS) {
+  await progress({ stepId: 'static-validation', stepStatus: 'RUNNING', message: 'Re-running static readiness check before execution validation.' });
+  buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
+  await reportStaticReadiness(options?.onProgress, buildReadiness, 'Static readiness check before execution validation');
+  while (buildReadiness.status === 'NEEDS_FIX' && !skipPaidValidationForStaticBlockers && buildReadinessFixIterations < MAX_BUILD_READINESS_FIX_ITERATIONS) {
     if (await stopForCostBudget('static readiness repair iteration')) break;
     const previousStaticSignature = staticFindingsSignature(buildReadiness);
     buildReadinessFixIterations += 1;
@@ -1139,6 +1390,7 @@ async function runSprintBuilderTracked(
       modelOverride: selectedAgentModels.dev,
       agentModelOverrides: selectedAgentModels,
       preparedTechStack,
+      specArtifacts,
       baOutput,
       existingFiles,
       recentRuns,
@@ -1168,7 +1420,7 @@ async function runSprintBuilderTracked(
       stepStatus: 'RUNNING',
       message: `Re-running static readiness check after DEV fix iteration ${buildReadinessFixIterations}.`
     });
-    buildReadiness = validateGeneratedProject(devOutput);
+    buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
     await reportStaticReadiness(options?.onProgress, buildReadiness, `Static readiness check after DEV fix ${buildReadinessFixIterations}`);
     await reportCostCheckpoint(`static readiness repair iteration ${buildReadinessFixIterations}`);
 
@@ -1177,7 +1429,7 @@ async function runSprintBuilderTracked(
         stepId: 'static-validation',
         stepStatus: 'FAIL',
         level: 'warn',
-        message: 'Static readiness findings did not change after the last DEV repair; stopping static repair loop and continuing deploy-first validation.'
+        message: 'Static readiness findings did not change after the last DEV repair; stopping static repair loop and letting the execution gate decide whether Docker/browser validation is still useful.'
       });
       break;
     }
@@ -1185,92 +1437,108 @@ async function runSprintBuilderTracked(
 
   let executionValidationFixIterations = 0;
   let executionValidation: GeneratedExecutionValidationResult;
+  staticBlockersBeforePaidValidation = deterministicStaticBlockerFindings(buildReadiness);
+  const skipExecutionForStaticBlockers =
+    buildReadiness.status === 'NEEDS_FIX' && staticBlockersBeforePaidValidation.length > 0;
 
   if (buildReadiness.status === 'NEEDS_FIX') {
     await progress({
       stepId: 'execution-validation',
-      stepStatus: 'RUNNING',
+      stepStatus: skipExecutionForStaticBlockers ? 'FAIL' : 'RUNNING',
       level: 'warn',
-      message: `Static readiness still has ${buildReadiness.findings.length} issue(s) after ${buildReadinessFixIterations}/${MAX_BUILD_READINESS_FIX_ITERATIONS} fix attempt(s); continuing deploy-first build/run validation.`
+      message: skipExecutionForStaticBlockers
+        ? `Static readiness still has ${staticBlockersBeforePaidValidation.length} deterministic blocker(s) after ${buildReadinessFixIterations}/${MAX_BUILD_READINESS_FIX_ITERATIONS} fix attempt(s); skipping Docker/browser execution and paid execution repair.`
+        : `Static readiness still has ${buildReadiness.findings.length} issue(s) after ${buildReadinessFixIterations}/${MAX_BUILD_READINESS_FIX_ITERATIONS} fix attempt(s); continuing deploy-first build/run validation.`
     });
   }
 
-  await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: 'Run generated project build/deploy smoke validation', artifact: 'generated-validation' });
-  await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: 'Running generated project build/deploy smoke validation.' });
-  executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
-
-  while (executionValidation.status === 'NEEDS_FIX' && executionValidationFixIterations < MAX_EXECUTION_VALIDATION_FIX_ITERATIONS) {
-    if (await stopForCostBudget('execution validation repair iteration')) break;
-    executionValidationFixIterations += 1;
-
-    await emit({
-      agentId: 'deploy',
-      eventType: 'REVIEW_REQUEST',
-      task: `Rancher/Desktop deploy smoke validation failed; DevOps sending fix request ${executionValidationFixIterations} to DEV`,
-      toAgent: 'dev',
-      artifact: 'generated-validation'
-    });
-
+  if (skipExecutionForStaticBlockers) {
     existingFiles = await readGeneratedCodeSnapshot();
-    const repairScope = executionValidation.repairScope;
-    if (repairScope) {
-      await reportRepairScope(options?.onProgress, repairScope);
-    }
-    const executionRepairFeedback = await formatExecutionValidationFeedback(executionValidation, existingFiles);
-    await progress({
-      stepId: 'dev',
-      stepStatus: 'RUNNING',
-      level: 'info',
-      message: `Prepared execution repair packet with validation logs, workspace tree, and generated project overview (${executionRepairFeedback.length} chars).`
+    executionValidation = createStaticBlockedExecutionValidation({
+      validation: buildReadiness,
+      blockers: staticBlockersBeforePaidValidation,
+      workspace: codeOutputDir,
+      repairScope: inferStaticRepairScope(buildReadiness, existingFiles)
     });
-    await emit({ agentId: 'dev', eventType: 'CODING', task: `Fix execution validation failures iteration ${executionValidationFixIterations}`, artifact: 'generated-files' });
-    devOutput = await runDevAgent({
-      requirements: input.requirements,
-      techSpec: input.techSpec,
-      requirementImages: input.requirementImages,
-      freeImageCandidates,
-      preparedMediaAssets,
-      uxContract,
-      modelOverride: selectedAgentModels.dev,
-      agentModelOverrides: selectedAgentModels,
-      preparedTechStack,
-      baOutput,
-      existingFiles,
-      recentRuns,
-      previousDevOutput: devOutput,
-      qaFeedback: executionRepairFeedback,
-      repairScope,
-      apiSpec: input.apiSpec,
-      projectDevSkill,
-      enrichedSkillContext: enrichedSkill.combined,
-      onProgress: progress,
-      onAgentActivity: emit,
-      signal: options?.signal
-    });
-    throwIfCanceled(options?.signal);
-    writeResult = await writeAndRefreshDevOutput(devOutput, preparedMediaAssetFiles);
-    devOutput = writeResult.devOutput;
-    codeOutputDir = writeResult.codeOutputDir;
-    projectDevSkill = await updateProjectSkillFromDevOutput({
-      devOutput,
-      executionValidation,
-      learningNotes: executionValidationLearningNotes(executionValidation),
-      reason: `Update TA DEV context after execution validation repair iteration ${executionValidationFixIterations}.`
-    });
-    await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: `Execution validation fixes generated iteration ${executionValidationFixIterations}`, toAgent: 'qa', artifact: 'generated-files' });
-
-    await progress({
-      stepId: 'static-validation',
-      stepStatus: 'RUNNING',
-      message: `Re-running static readiness check after execution fix iteration ${executionValidationFixIterations}.`
-    });
-    buildReadiness = validateGeneratedProject(devOutput);
-    await reportStaticReadiness(options?.onProgress, buildReadiness, `Static readiness check after execution fix ${executionValidationFixIterations}`);
-
-    await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: `Re-run generated project execution validation iteration ${executionValidationFixIterations}`, artifact: 'generated-validation' });
-    await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: `Re-running generated project build/deploy smoke validation iteration ${executionValidationFixIterations}.` });
+  } else {
+    await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: 'Run generated project build/deploy smoke validation', artifact: 'generated-validation' });
+    await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: 'Running generated project build/deploy smoke validation.' });
     executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
-    await reportCostCheckpoint(`execution validation repair iteration ${executionValidationFixIterations}`);
+
+    while (executionValidation.status === 'NEEDS_FIX' && executionValidationFixIterations < MAX_EXECUTION_VALIDATION_FIX_ITERATIONS) {
+      if (await stopForCostBudget('execution validation repair iteration')) break;
+      executionValidationFixIterations += 1;
+
+      await emit({
+        agentId: 'deploy',
+        eventType: 'REVIEW_REQUEST',
+        task: `Rancher/Desktop deploy smoke validation failed; DevOps sending fix request ${executionValidationFixIterations} to DEV`,
+        toAgent: 'dev',
+        artifact: 'generated-validation'
+      });
+
+      existingFiles = await readGeneratedCodeSnapshot();
+      const repairScope = executionValidation.repairScope;
+      if (repairScope) {
+        await reportRepairScope(options?.onProgress, repairScope);
+      }
+      const executionRepairFeedback = await formatExecutionValidationFeedback(executionValidation, existingFiles);
+      await progress({
+        stepId: 'dev',
+        stepStatus: 'RUNNING',
+        level: 'info',
+        message: `Prepared execution repair packet with validation logs, workspace tree, and generated project overview (${executionRepairFeedback.length} chars).`
+      });
+      await emit({ agentId: 'dev', eventType: 'CODING', task: `Fix execution validation failures iteration ${executionValidationFixIterations}`, artifact: 'generated-files' });
+      devOutput = await runDevAgent({
+        requirements: input.requirements,
+        techSpec: input.techSpec,
+        requirementImages: input.requirementImages,
+        freeImageCandidates,
+        preparedMediaAssets,
+        uxContract,
+        modelOverride: selectedAgentModels.dev,
+        agentModelOverrides: selectedAgentModels,
+        preparedTechStack,
+        specArtifacts,
+        baOutput,
+        existingFiles,
+        recentRuns,
+        previousDevOutput: devOutput,
+        qaFeedback: executionRepairFeedback,
+        repairScope,
+        apiSpec: input.apiSpec,
+        projectDevSkill,
+        enrichedSkillContext: enrichedSkill.combined,
+        onProgress: progress,
+        onAgentActivity: emit,
+        signal: options?.signal
+      });
+      throwIfCanceled(options?.signal);
+      writeResult = await writeAndRefreshDevOutput(devOutput, preparedMediaAssetFiles);
+      devOutput = writeResult.devOutput;
+      codeOutputDir = writeResult.codeOutputDir;
+      projectDevSkill = await updateProjectSkillFromDevOutput({
+        devOutput,
+        executionValidation,
+        learningNotes: executionValidationLearningNotes(executionValidation),
+        reason: `Update TA DEV context after execution validation repair iteration ${executionValidationFixIterations}.`
+      });
+      await emit({ agentId: 'dev', eventType: 'WORK_COMPLETE', task: `Execution validation fixes generated iteration ${executionValidationFixIterations}`, toAgent: 'qa', artifact: 'generated-files' });
+
+      await progress({
+        stepId: 'static-validation',
+        stepStatus: 'RUNNING',
+        message: `Re-running static readiness check after execution fix iteration ${executionValidationFixIterations}.`
+      });
+      buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
+      await reportStaticReadiness(options?.onProgress, buildReadiness, `Static readiness check after execution fix ${executionValidationFixIterations}`);
+
+      await emit({ agentId: 'deploy', eventType: 'EXECUTING', task: `Re-run generated project execution validation iteration ${executionValidationFixIterations}`, artifact: 'generated-validation' });
+      await progress({ stepId: 'execution-validation', stepStatus: 'RUNNING', message: `Re-running generated project build/deploy smoke validation iteration ${executionValidationFixIterations}.` });
+      executionValidation = await validateGeneratedProjectExecution(progress, options?.signal);
+      await reportCostCheckpoint(`execution validation repair iteration ${executionValidationFixIterations}`);
+    }
   }
 
   if (executionValidation.status === 'NEEDS_FIX' && executionValidationFixIterations >= MAX_EXECUTION_VALIDATION_FIX_ITERATIONS) {
@@ -1352,6 +1620,7 @@ async function runSprintBuilderTracked(
         requirementImages: input.requirementImages,
         preparedTechStack,
         uxContract,
+        specArtifacts,
         baOutput,
         devOutput,
         existingFiles: await readGeneratedCodeSnapshot(),
@@ -1393,6 +1662,7 @@ async function runSprintBuilderTracked(
       modelOverride: selectedAgentModels.dev,
       agentModelOverrides: selectedAgentModels,
       preparedTechStack,
+      specArtifacts,
       baOutput,
       existingFiles,
       recentRuns,
@@ -1424,7 +1694,7 @@ async function runSprintBuilderTracked(
       stepStatus: 'RUNNING',
       message: `Re-running static readiness check after QA fix iteration ${qaFixIterations}.`
     });
-    buildReadiness = validateGeneratedProject(devOutput);
+    buildReadiness = validateGeneratedProject(devOutput, preparedTechStack);
     await reportStaticReadiness(options?.onProgress, buildReadiness, `Static readiness check after QA fix ${qaFixIterations}`);
 
     if (buildReadiness.status === 'NEEDS_FIX') {
@@ -1452,6 +1722,7 @@ async function runSprintBuilderTracked(
       requirementImages: input.requirementImages,
       preparedTechStack,
       uxContract,
+      specArtifacts,
       baOutput,
       devOutput,
       existingFiles: await readGeneratedCodeSnapshot(),
@@ -1490,6 +1761,26 @@ async function runSprintBuilderTracked(
       ? `${deployValidation.summary}\n\nFinal generated project execution validation passed after DEV repair iterations, so deploy readiness was reconciled to PASS.`
       : deployValidation.summary;
 
+  specArtifacts = buildFinalSpecArtifacts({
+    preDevSpecArtifacts: specArtifacts,
+    devOutput,
+    projectDevContextPath: projectDevSkill?.path,
+    codeReviewStatus: codeReview.status,
+    codeReviewSummary: codeReview.summary,
+    deployValidationStatus: finalDeployValidationStatus,
+    deployValidationSummary: finalDeployValidationSummary,
+    executionValidation,
+    qaReview,
+    costSummary,
+    costControlNotes
+  });
+  await progress({
+    stepId: 'complete',
+    stepStatus: 'PENDING',
+    level: 'success',
+    message: `Final spec artifacts prepared: ${specArtifacts.map((artifact) => artifact.path).join(', ')}.`
+  });
+
   const result: RunResult = {
     runId,
     createdAt: new Date().toISOString(),
@@ -1522,6 +1813,7 @@ async function runSprintBuilderTracked(
     costBudgetUsd: RUN_COST_BUDGET_USD > 0 ? RUN_COST_BUDGET_USD : undefined,
     costBudgetExceeded,
     costControlNotes,
+    specArtifacts,
     events,
     outputDir: '',
     codeOutputDir

@@ -36,9 +36,9 @@ README.md
 - Full-stack frontends with server rendering must document both public/browser API URLs and internal/server API URLs
 
 ### Port Conventions
-- Frontend: host port configurable (default 3001), container port configurable (default 3000)
-- Backend: host port configurable (default 8000), container port configurable (default 8000)
-- Database: host port configurable, container port per database standard
+- Frontend: host port configurable (default 55001), container port configurable (default 3000)
+- Backend: host port configurable (default 55080), container port per framework such as 8000 or 8080
+- Database: host port configurable (default 55432 for PostgreSQL), container port per database standard
 
 ## Generation Standards
 

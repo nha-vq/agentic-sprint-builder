@@ -4,7 +4,7 @@ import type { FreeImageCandidate, GeneratedFile, RequirementImage, RunResult } f
 
 function formatFreeImageCandidates(candidates?: FreeImageCandidate[]) {
   if (!candidates?.length) {
-    return 'No free/safe remote image candidates were found for this requirement. If imagery is needed, ask DEV to use neutral CSS/placeholders rather than unsafe hotlinks.';
+    return 'No free/safe remote image candidates were found for this requirement. If imagery is required by product cards, hero media, galleries, or detail pages, record this as a media acquisition blocker. Do not instruct DEV to ship empty CSS/image placeholders as a completed visual implementation.';
   }
 
   return candidates
@@ -56,7 +56,7 @@ ${imageContext}
 FREE/SAFE IMAGE CANDIDATES:
 ${formatFreeImageCandidates(input.freeImageCandidates)}
 
-When image candidates are relevant, choose image URLs that are visually close to the provided UI mockups or expected product imagery. Include selected URLs in Frontend Visual Design Contract > Media And Product Imagery and DEV Implementation Notes with source/license notes. If none are relevant, say so and direct DEV to use neutral placeholders.
+When image candidates are relevant, choose image URLs that are visually close to the provided UI mockups or expected product imagery. Include selected URLs in Frontend Visual Design Contract > Media And Product Imagery and DEV Implementation Notes with source/license notes. If none are relevant, say so as a media blocker and require the media acquisition/DEV handoff to provide local licensed assets before declaring visual fidelity complete.
 
 EXISTING GENERATED CODE:
 ${existingCodeContext}
